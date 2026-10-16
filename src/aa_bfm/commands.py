@@ -1,7 +1,7 @@
 """Paired LAFAN1 reference command for supervised FB training.
 
 Each episode is one clip. The robot starts at frame 0, the episode ends at the
-last frame, and the command exposes an ``H``-step lookahead of that same clip.
+last frame, and the command exposes the reference at the configured lookahead steps.
 """
 
 from __future__ import annotations
@@ -40,13 +40,13 @@ _KEYPOINT_NAMES = (
 
 
 class BFMCommand(Command):
-    """Track one LAFAN1 clip from frame 0, with an H-step reference lookahead."""
+    """Track one LAFAN1 clip from frame 0, observing specific future frames."""
 
     out_keys = ["crash_active", "fall_over_active"]
 
     def __init__(
         self,
-        horizon: int = 8,
+        lookahead: list[int] | None = None,
         data_path: str | None = None,
         reward_std: float = 0.5,
         fall_xy_thres: float = 0.8,
@@ -54,9 +54,11 @@ class BFMCommand(Command):
         clip_regex: list[str] | None = None,
     ):
         super().__init__()
-        if horizon < 1:
-            raise ValueError(f"horizon must be positive, got {horizon}")
-        self.horizon = int(horizon)
+        offsets = [int(step) for step in (lookahead or [1, 8, 16, 32])]
+        if not offsets or any(step < 1 for step in offsets):
+            raise ValueError(f"lookahead steps must be positive, got {offsets}")
+        self.lookahead = offsets
+        self.num_lookahead = len(offsets)
         self.data_path = data_path
         self.reward_std = float(reward_std)
         self.fall_xy_thres = float(fall_xy_thres)
@@ -94,8 +96,11 @@ class BFMCommand(Command):
             return torch.as_tensor(np.concatenate(parts, axis=0), device=self.device)
 
         lengths = [int(ends[i] - starts[i]) for i in keep]
-        if min(lengths) < self.horizon:
-            raise ValueError(f"Every selected clip must be at least horizon={self.horizon} frames")
+        furthest = max(self.lookahead)
+        if min(lengths) <= furthest:
+            raise ValueError(
+                f"Every selected clip must be longer than lookahead {furthest}, got {min(lengths)}"
+            )
         cursor = 0
         packed_starts = []
         packed_ends = []
@@ -130,18 +135,22 @@ class BFMCommand(Command):
         self.t = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         keypoint_count = len(self.keypoint_names)
         self.ref_keypoint_pos = torch.zeros(
-            self.num_envs, self.horizon, keypoint_count, 3, device=self.device
+            self.num_envs, self.num_lookahead, keypoint_count, 3, device=self.device
         )
         self.ref_keypoint_quat = torch.zeros(
-            self.num_envs, self.horizon, keypoint_count, 4, device=self.device
+            self.num_envs, self.num_lookahead, keypoint_count, 4, device=self.device
         )
         self.ref_keypoint_pos_b = torch.zeros(
-            self.num_envs, self.horizon, keypoint_count, 3, device=self.device
+            self.num_envs, self.num_lookahead, keypoint_count, 3, device=self.device
         )
-        self.ref_root_pos = torch.zeros(self.num_envs, self.horizon, 3, device=self.device)
-        self.ref_root_quat = torch.zeros(self.num_envs, self.horizon, 4, device=self.device)
-        self.ref_root_rot6d_b = torch.zeros(self.num_envs, self.horizon, 6, device=self.device)
-        self._lookahead = torch.arange(self.horizon, device=self.device)
+        self.ref_root_pos = torch.zeros(self.num_envs, self.num_lookahead, 3, device=self.device)
+        self.ref_root_quat = torch.zeros(self.num_envs, self.num_lookahead, 4, device=self.device)
+        self.ref_root_rot6d_b = torch.zeros(self.num_envs, self.num_lookahead, 6, device=self.device)
+        self.cur_keypoint_pos = torch.zeros(self.num_envs, keypoint_count, 3, device=self.device)
+        self.cur_keypoint_quat = torch.zeros(self.num_envs, keypoint_count, 4, device=self.device)
+        self.cur_root_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self.cur_root_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        self._lookahead = torch.tensor(self.lookahead, dtype=torch.long, device=self.device)
         self.ref_frame_marker = None
         if self.env.sim.has_gui():
             self.ref_frame_marker = self.env.scene.create_frame_marker(
@@ -206,17 +215,22 @@ class BFMCommand(Command):
         self._load_lookahead()
         return origins
 
-    def _gather(self, field: torch.Tensor) -> torch.Tensor:
-        local = self.t.unsqueeze(1) + self._lookahead
+    def _gather(self, field: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        local = self.t.unsqueeze(1) + offsets
         limit = self.lengths[self.motion_ids].unsqueeze(1) - 1
         local = torch.minimum(local, limit)
         return field[self.starts[self.motion_ids].unsqueeze(1) + local]
 
     def _load_lookahead(self) -> None:
-        self.ref_keypoint_pos = self._gather(self.keypoint_pos)
-        self.ref_keypoint_quat = self._gather(self.keypoint_quat)
-        self.ref_root_pos = self._gather(self.root_pos)
-        self.ref_root_quat = self._gather(self.root_quat)
+        now = self._lookahead.new_zeros(1)
+        self.cur_keypoint_pos = self._gather(self.keypoint_pos, now).squeeze(1)
+        self.cur_keypoint_quat = self._gather(self.keypoint_quat, now).squeeze(1)
+        self.cur_root_pos = self._gather(self.root_pos, now).squeeze(1)
+        self.cur_root_quat = self._gather(self.root_quat, now).squeeze(1)
+        self.ref_keypoint_pos = self._gather(self.keypoint_pos, self._lookahead)
+        self.ref_keypoint_quat = self._gather(self.keypoint_quat, self._lookahead)
+        self.ref_root_pos = self._gather(self.root_pos, self._lookahead)
+        self.ref_root_quat = self._gather(self.root_quat, self._lookahead)
         current_quat = self.asset.data.root_link_quat_w
         relative = quat_mul(quat_conjugate(current_quat.unsqueeze(1)), self.ref_root_quat)
         self.ref_root_rot6d_b = rot6d(relative)
@@ -257,7 +271,7 @@ class BFMCommand(Command):
         """Mirror future keypoint positions and the body-frame root orientation."""
         positions = cartesian_space_symmetry(self.asset, self.keypoint_names, sign=(1, -1, 1))
         return SymmetryTransform.cat(
-            [positions.repeat(self.horizon), SymmetryTransform.rot6d().repeat(self.horizon)]
+            [positions.repeat(self.num_lookahead), SymmetryTransform.rot6d().repeat(self.num_lookahead)]
         )
 
     @override
@@ -280,12 +294,12 @@ class BFMCommand(Command):
     @override
     def command_state_spec(self) -> dict[str, tuple[int, ...]]:
         return {
-            "ref_keypoint_pos": (self.horizon, len(self.keypoint_names), 3),
-            "ref_keypoint_quat": (self.horizon, len(self.keypoint_names), 4),
-            "ref_keypoint_pos_b": (self.horizon, len(self.keypoint_names), 3),
-            "ref_root_pos": (self.horizon, 3),
-            "ref_root_quat": (self.horizon, 4),
-            "ref_root_rot6d_b": (self.horizon, 6),
+            "ref_keypoint_pos": (self.num_lookahead, len(self.keypoint_names), 3),
+            "ref_keypoint_quat": (self.num_lookahead, len(self.keypoint_names), 4),
+            "ref_keypoint_pos_b": (self.num_lookahead, len(self.keypoint_names), 3),
+            "ref_root_pos": (self.num_lookahead, 3),
+            "ref_root_quat": (self.num_lookahead, 4),
+            "ref_root_rot6d_b": (self.num_lookahead, 6),
             "motion_id": (),
             "frame": (),
         }
@@ -301,8 +315,8 @@ class BFMCommand(Command):
         if self.ref_frame_marker is None:
             return
         self.ref_frame_marker.visualize(
-            translations=self.ref_root_pos[:, 0] + self.env.episode_origin,
-            orientations=self.ref_root_quat[:, 0],
+            translations=self.cur_root_pos + self.env.episode_origin,
+            orientations=self.cur_root_quat,
         )
 
 
@@ -342,7 +356,7 @@ class tracking_keypoint_pos_exp(Reward):
     @override
     def _compute(self) -> torch.Tensor:
         command = self.command_manager
-        target = command.env.episode_origin[:, None, :] + command.ref_keypoint_pos[:, 0]
+        target = command.env.episode_origin[:, None, :] + command.cur_keypoint_pos[:, self.motion_index]
         target = target[:, self.motion_index, : self.ndims]
         current = command.asset.data.body_link_pos_w[:, self.asset_index, : self.ndims]
         error = (target - current).square().sum(dim=-1)
@@ -377,7 +391,7 @@ class tracking_keypoint_ori_exp(Reward):
     @override
     def _compute(self) -> torch.Tensor:
         command = self.command_manager
-        target = command.ref_keypoint_quat[:, 0, self.motion_index]
+        target = command.cur_keypoint_quat[:, self.motion_index]
         current = command.asset.data.body_link_quat_w[:, self.asset_index]
         delta = quat_mul(target, quat_conjugate(current))
         error = axis_angle_from_quat(delta).square().sum(dim=-1)
@@ -397,7 +411,7 @@ class tracking_root_pos_exp(Reward):
         if not isinstance(command, BFMCommand):
             raise TypeError("tracking_root_pos_exp requires BFMCommand")
         current = command.asset.data.root_link_pos_w
-        target = command.env.episode_origin + command.ref_root_pos[:, 0]
+        target = command.env.episode_origin + command.cur_root_pos
         error = (current - target).square().sum(dim=-1, keepdim=True)
         return torch.exp(-error / self.std**2)
 
@@ -415,7 +429,7 @@ class tracking_root_ori_exp(Reward):
         if not isinstance(command, BFMCommand):
             raise TypeError("tracking_root_ori_exp requires BFMCommand")
         current = command.asset.data.root_link_quat_w
-        target = command.ref_root_quat[:, 0]
+        target = command.cur_root_quat
         delta = quat_mul(quat_conjugate(target), current)
         error = axis_angle_from_quat(delta).square().sum(dim=-1, keepdim=True)
         return torch.exp(-error / self.std**2)

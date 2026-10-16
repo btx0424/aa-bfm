@@ -43,7 +43,7 @@ input:
 
 command:
   _target_: BFMCommand
-  horizon: 8
+  lookahead: [1, 8, 16, 32]
   reward_std: 0.5
   fall_xy_thres: 0.8
   ground_height: 0.4
@@ -59,6 +59,9 @@ observation:
     joint_pos_multistep: {joint_names: ".*", steps: 4, noise_std: 0.01}
     joint_vel_multistep: {joint_names: ".*", steps: 4, noise_std: 0.5}
     prev_actions: {steps: 1}
+  # One kinematic frame. Slice this group over time to build the SMP window.
+  smp_:
+    smp_state: {}
 
 reward:
   track:
@@ -100,6 +103,8 @@ reward:
     action_rate2_l2:    {weight: 0.002}
     joint_torques_l2: {weight: 1.0e-5}
     energy_l1:          {weight: 2.0e-4}
+    joint_acc_l2:       {weight: 2.5e-7}
+    feet_sliding:       {weight: 0.2, body_names: .*ankle_roll_link}
 
 termination:
   max_episode_length: {}
