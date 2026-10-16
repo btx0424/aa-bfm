@@ -117,6 +117,16 @@ class smp_state(Observation):
             dtype=torch.long,
             device=self.device,
         )
+        joint_count = int(self.asset.data.joint_pos.shape[-1])
+        body_count = int(self.asset.data.body_link_pos_w.shape[1])
+        if int(self.joint_index.max()) >= joint_count:
+            raise IndexError(
+                f"SMP joint index {int(self.joint_index.max())} is outside joint_pos ({joint_count})"
+            )
+        if int(self.ee_index.max()) >= body_count:
+            raise IndexError(
+                f"SMP body index {int(self.ee_index.max())} is outside body_link_pos_w ({body_count})"
+            )
 
     @override
     def compute(self) -> torch.Tensor:

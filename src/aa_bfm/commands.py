@@ -129,6 +129,18 @@ class BFMCommand(Command):
         self.keypoint_pos = self.keypoint_pos[:, order]
         self.keypoint_quat = self.keypoint_quat[:, order]
         self.asset_keypoint_index = torch.tensor(asset_index, dtype=torch.long, device=self.device)
+        body_count = int(self.asset.data.body_link_pos_w.shape[1])
+        joint_count = int(self.asset.data.joint_pos.shape[-1])
+        if int(self.asset_keypoint_index.max()) >= body_count:
+            raise IndexError(
+                f"Keypoint body index {int(self.asset_keypoint_index.max())} "
+                f"is outside body_link_pos_w ({body_count})"
+            )
+        if int(self.asset_joint_index.max()) >= joint_count:
+            raise IndexError(
+                f"Motion joint index {int(self.asset_joint_index.max())} "
+                f"is outside joint_pos ({joint_count})"
+            )
         self._clip_flags()
 
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -217,9 +229,10 @@ class BFMCommand(Command):
 
     def _gather(self, field: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         local = self.t.unsqueeze(1) + offsets
-        limit = self.lengths[self.motion_ids].unsqueeze(1) - 1
-        local = torch.minimum(local, limit)
-        return field[self.starts[self.motion_ids].unsqueeze(1) + local]
+        limit = (self.lengths[self.motion_ids] - 1).unsqueeze(1).clamp(min=0)
+        local = torch.minimum(local.clamp(min=0), limit)
+        index = (self.starts[self.motion_ids].unsqueeze(1) + local).clamp(0, field.shape[0] - 1)
+        return field[index]
 
     def _load_lookahead(self) -> None:
         now = self._lookahead.new_zeros(1)
@@ -356,8 +369,8 @@ class tracking_keypoint_pos_exp(Reward):
     @override
     def _compute(self) -> torch.Tensor:
         command = self.command_manager
-        target = command.env.episode_origin[:, None, :] + command.cur_keypoint_pos[:, self.motion_index]
-        target = target[:, self.motion_index, : self.ndims]
+        target = command.cur_keypoint_pos[:, self.motion_index] + command.env.episode_origin[:, None, :]
+        target = target[..., : self.ndims]
         current = command.asset.data.body_link_pos_w[:, self.asset_index, : self.ndims]
         error = (target - current).square().sum(dim=-1)
         return torch.exp(-error / self.std**2).mean(dim=-1, keepdim=True)
