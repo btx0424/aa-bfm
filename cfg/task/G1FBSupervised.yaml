@@ -63,6 +63,8 @@ observation:
 reward:
   track:
     tracking_joint_exp: {weight: 1.0}
+    tracking_root_pos_exp: {weight: 1.0, std: 0.3}
+    tracking_root_ori_exp: {weight: 1.0, std: 0.4}
   reg:
     action_rate_l2: {weight: 0.01}
     joint_torques_l2: {weight: 1.0e-5}

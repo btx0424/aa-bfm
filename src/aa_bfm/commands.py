@@ -6,15 +6,10 @@ last frame, and the command exposes an ``H``-step lookahead of that same clip.
 
 from __future__ import annotations
 
-import json
 import re
-import urllib.request
-from pathlib import Path
 
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation as SRot
-from scipy.spatial.transform import Slerp
 from tensordict import TensorDict, TensorDictBase
 from typing_extensions import override
 
@@ -25,209 +20,11 @@ from active_adaptation.utils.math import (
     quat_conjugate,
     quat_mul,
     quat_rotate_inverse,
+    rot6d,
 )
+from active_adaptation.utils.symmetry import SymmetryTransform, joint_space_symmetry
 
-# Unitree G1 CSV layout from lvhaidong/LAFAN1_Retargeting_Dataset (30 Hz).
-# Root is xyz + quaternion xyzw, then the 29 actuated joints.
-_G1_JOINT_NAMES = (
-    "left_hip_pitch_joint",
-    "left_hip_roll_joint",
-    "left_hip_yaw_joint",
-    "left_knee_joint",
-    "left_ankle_pitch_joint",
-    "left_ankle_roll_joint",
-    "right_hip_pitch_joint",
-    "right_hip_roll_joint",
-    "right_hip_yaw_joint",
-    "right_knee_joint",
-    "right_ankle_pitch_joint",
-    "right_ankle_roll_joint",
-    "waist_yaw_joint",
-    "waist_roll_joint",
-    "waist_pitch_joint",
-    "left_shoulder_pitch_joint",
-    "left_shoulder_roll_joint",
-    "left_shoulder_yaw_joint",
-    "left_elbow_joint",
-    "left_wrist_roll_joint",
-    "left_wrist_pitch_joint",
-    "left_wrist_yaw_joint",
-    "right_shoulder_pitch_joint",
-    "right_shoulder_roll_joint",
-    "right_shoulder_yaw_joint",
-    "right_elbow_joint",
-    "right_wrist_roll_joint",
-    "right_wrist_pitch_joint",
-    "right_wrist_yaw_joint",
-)
-_CLIP_NAMES = (
-    "dance1_subject1",
-    "dance1_subject2",
-    "dance1_subject3",
-    "dance2_subject1",
-    "dance2_subject2",
-    "dance2_subject3",
-    "dance2_subject4",
-    "dance2_subject5",
-    "fallAndGetUp1_subject1",
-    "fallAndGetUp1_subject4",
-    "fallAndGetUp1_subject5",
-    "fallAndGetUp2_subject2",
-    "fallAndGetUp2_subject3",
-    "fallAndGetUp3_subject1",
-    "fight1_subject2",
-    "fight1_subject3",
-    "fight1_subject5",
-    "fightAndSports1_subject1",
-    "fightAndSports1_subject4",
-    "jumps1_subject1",
-    "jumps1_subject2",
-    "jumps1_subject5",
-    "run1_subject2",
-    "run1_subject5",
-    "run2_subject1",
-    "run2_subject4",
-    "sprint1_subject2",
-    "sprint1_subject4",
-    "walk1_subject1",
-    "walk1_subject2",
-    "walk1_subject5",
-    "walk2_subject1",
-    "walk2_subject3",
-    "walk2_subject4",
-    "walk3_subject1",
-    "walk3_subject2",
-    "walk3_subject3",
-    "walk3_subject4",
-    "walk3_subject5",
-    "walk4_subject1",
-)
-_SOURCE_FPS = 30
-_TARGET_FPS = 50
-_HF_BASE = (
-    "https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset"
-    "/resolve/main/g1"
-)
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _slerp(x: np.ndarray, xp: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
-    slerp = Slerp(xp, SRot.from_quat(quat_wxyz, scalar_first=True))
-    return slerp(x).as_quat(scalar_first=True)
-
-
-def _resample(values: np.ndarray, source_fps: int, target_fps: int, quat: bool = False) -> np.ndarray:
-    length = values.shape[0]
-    duration = (length - 1) / source_fps
-    xp = np.linspace(0.0, duration, length)
-    x = np.arange(0.0, duration, 1.0 / target_fps)
-    if quat:
-        return _slerp(x, xp, values)
-    flat = values.reshape(length, -1)
-    out = np.stack([np.interp(x, xp, flat[:, i]) for i in range(flat.shape[1])], axis=-1)
-    return out.reshape(len(x), *values.shape[1:])
-
-
-def _angular_velocity(quat_wxyz: torch.Tensor, dt: float) -> torch.Tensor:
-    dq = quat_mul(quat_wxyz[1:], quat_conjugate(quat_wxyz[:-1]))
-    angvel = axis_angle_from_quat(dq) / dt
-    return torch.cat([angvel, angvel[-1:]], dim=0)
-
-
-class Dataloader:
-    """Download the G1 retarget of LAFAN1 into ``aa-bfm/data/lafan1``."""
-
-    source_fps = _SOURCE_FPS
-    target_fps = _TARGET_FPS
-
-    def __init__(self, root: str | Path | None = None):
-        self.root = Path(root) if root is not None else _repo_root() / "data" / "lafan1"
-
-    @property
-    def archive_path(self) -> Path:
-        return self.root / "motions.npz"
-
-    def ensure(self) -> Path:
-        if self.archive_path.is_file():
-            return self.archive_path
-        raw = self.root / "raw"
-        raw.mkdir(parents=True, exist_ok=True)
-        self.root.mkdir(parents=True, exist_ok=True)
-        clips = []
-        for name in _CLIP_NAMES:
-            csv_path = raw / f"{name}.csv"
-            if not csv_path.is_file():
-                url = f"{_HF_BASE}/{name}.csv"
-                print(f"Downloading {url}", flush=True)
-                request = urllib.request.Request(url, headers={"User-Agent": "aa-bfm"})
-                with urllib.request.urlopen(request, timeout=120) as response:
-                    csv_path.write_bytes(response.read())
-            clips.append(self._load_csv(csv_path))
-        self._write(clips)
-        return self.archive_path
-
-    def _load_csv(self, path: Path) -> dict[str, np.ndarray]:
-        rows = np.loadtxt(path, delimiter=",")
-        if rows.ndim != 2 or rows.shape[1] != 7 + len(_G1_JOINT_NAMES):
-            raise ValueError(
-                f"{path} has shape {rows.shape}, expected (*, {7 + len(_G1_JOINT_NAMES)})"
-            )
-        root_pos = rows[:, 0:3]
-        quat_xyzw = rows[:, 3:7]
-        quat_wxyz = np.concatenate([quat_xyzw[:, 3:4], quat_xyzw[:, 0:3]], axis=-1)
-        joint_pos = rows[:, 7:]
-        root_pos = _resample(root_pos, self.source_fps, self.target_fps)
-        quat_wxyz = _resample(quat_wxyz, self.source_fps, self.target_fps, quat=True)
-        joint_pos = _resample(joint_pos, self.source_fps, self.target_fps)
-        root_pos = root_pos.copy()
-        root_pos[:, 0:2] -= root_pos[0, 0:2]
-        dt = 1.0 / self.target_fps
-        root_lin_vel = np.diff(root_pos, axis=0) / dt
-        root_lin_vel = np.concatenate([root_lin_vel, root_lin_vel[-1:]], axis=0)
-        joint_vel = np.diff(joint_pos, axis=0) / dt
-        joint_vel = np.concatenate([joint_vel, joint_vel[-1:]], axis=0)
-        quat = torch.as_tensor(quat_wxyz, dtype=torch.float32)
-        root_ang_vel = _angular_velocity(quat, dt).numpy()
-        return {
-            "root_pos": root_pos.astype(np.float32),
-            "root_quat": quat_wxyz.astype(np.float32),
-            "root_lin_vel": root_lin_vel.astype(np.float32),
-            "root_ang_vel": root_ang_vel.astype(np.float32),
-            "joint_pos": joint_pos.astype(np.float32),
-            "joint_vel": joint_vel.astype(np.float32),
-        }
-
-    def _write(self, clips: list[dict[str, np.ndarray]]) -> None:
-        starts = []
-        ends = []
-        packed = {key: [] for key in clips[0]}
-        cursor = 0
-        for clip in clips:
-            length = clip["root_pos"].shape[0]
-            starts.append(cursor)
-            cursor += length
-            ends.append(cursor)
-            for key, value in clip.items():
-                packed[key].append(value)
-        np.savez(
-            self.archive_path,
-            joint_names=np.array(_G1_JOINT_NAMES),
-            clip_names=np.array(_CLIP_NAMES),
-            fps=np.int64(self.target_fps),
-            starts=np.asarray(starts, dtype=np.int64),
-            ends=np.asarray(ends, dtype=np.int64),
-            **{key: np.concatenate(value, axis=0) for key, value in packed.items()},
-        )
-        meta = {
-            "fps": self.target_fps,
-            "joint_names": list(_G1_JOINT_NAMES),
-            "clip_names": list(_CLIP_NAMES),
-            "source": _HF_BASE,
-        }
-        (self.root / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+from .data import TARGET_FPS, Dataloader
 
 
 class BFMCommand(Command):
@@ -257,9 +54,9 @@ class BFMCommand(Command):
     @override
     def _initialize(self, env) -> None:
         super()._initialize(env)
-        if abs(float(self.env.step_dt) - 1.0 / _TARGET_FPS) > 1.0e-4:
+        if abs(float(self.env.step_dt) - 1.0 / TARGET_FPS) > 1.0e-4:
             raise ValueError(
-                f"BFMCommand motions are {_TARGET_FPS} Hz, but step_dt is {self.env.step_dt}"
+                f"BFMCommand motions are {TARGET_FPS} Hz, but step_dt is {self.env.step_dt}"
             )
         archive = Dataloader(self.data_path).ensure()
         motions = np.load(archive, allow_pickle=False)
@@ -312,6 +109,7 @@ class BFMCommand(Command):
         )
         self.ref_root_pos = torch.zeros(self.num_envs, self.horizon, 3, device=self.device)
         self.ref_root_quat = torch.zeros(self.num_envs, self.horizon, 4, device=self.device)
+        self.ref_root_rot6d_b = torch.zeros(self.num_envs, self.horizon, 6, device=self.device)
         self.track_reward = torch.zeros(self.num_envs, 1, device=self.device)
         self._lookahead = torch.arange(self.horizon, device=self.device)
         self.ref_frame_marker = None
@@ -388,6 +186,9 @@ class BFMCommand(Command):
         self.ref_joint_pos = self._gather(self.joint_pos)
         self.ref_root_pos = self._gather(self.root_pos)
         self.ref_root_quat = self._gather(self.root_quat)
+        current = self.asset.data.root_link_quat_w.unsqueeze(1)
+        relative = quat_mul(quat_conjugate(current), self.ref_root_quat)
+        self.ref_root_rot6d_b = rot6d(relative)
 
     def _refresh_track_reward(self) -> None:
         current = self.asset.data.joint_pos[:, self.asset_joint_index]
@@ -415,7 +216,19 @@ class BFMCommand(Command):
 
     @property
     def command(self) -> torch.Tensor:
-        return self.ref_joint_pos.reshape(self.num_envs, -1)
+        return torch.cat(
+            [
+                self.ref_joint_pos.reshape(self.num_envs, -1),
+                self.ref_root_rot6d_b.reshape(self.num_envs, -1),
+            ],
+            dim=-1,
+        )
+
+    def symmetry_transform(self) -> SymmetryTransform:
+        """Mirror future joint targets and the body-frame reference orientation."""
+        joints = joint_space_symmetry(self.asset, self.joint_names).repeat(self.horizon)
+        orientation = SymmetryTransform.rot6d().repeat(self.horizon)
+        return SymmetryTransform.cat([joints, orientation])
 
     @override
     def get_state(self) -> TensorDict:
@@ -424,6 +237,7 @@ class BFMCommand(Command):
                 "ref_joint_pos": self.ref_joint_pos,
                 "ref_root_pos": self.ref_root_pos,
                 "ref_root_quat": self.ref_root_quat,
+                "ref_root_rot6d_b": self.ref_root_rot6d_b,
                 "track_reward": self.track_reward,
                 "motion_id": self.motion_ids,
                 "frame": self.t,
@@ -439,6 +253,7 @@ class BFMCommand(Command):
             "ref_joint_pos": (self.horizon, joint_count),
             "ref_root_pos": (self.horizon, 3),
             "ref_root_quat": (self.horizon, 4),
+            "ref_root_rot6d_b": (self.horizon, 6),
             "track_reward": (1,),
             "motion_id": (),
             "frame": (),
@@ -447,8 +262,9 @@ class BFMCommand(Command):
     @override
     def from_state(self, command_state: TensorDictBase, key: str | None = None) -> torch.Tensor:
         del key
-        ref = command_state["ref_joint_pos"]
-        return ref.reshape(ref.shape[0], -1)
+        joints = command_state["ref_joint_pos"].reshape(command_state.shape[0], -1)
+        orientation = command_state["ref_root_rot6d_b"].reshape(command_state.shape[0], -1)
+        return torch.cat([joints, orientation], dim=-1)
 
     def debug_draw(self) -> None:
         if self.ref_frame_marker is None:
@@ -475,4 +291,41 @@ class tracking_joint_exp(Reward):
             return command.track_reward
         current = command.asset.data.joint_pos[:, command.asset_joint_index]
         error = (current - command.ref_joint_pos[:, 0]).square().mean(dim=-1, keepdim=True)
+        return torch.exp(-error / self.std**2)
+
+
+class tracking_root_pos_exp(Reward):
+    """Exponential root-position match against the current reference frame."""
+
+    def __init__(self, weight: float, std: float = 0.3):
+        super().__init__(weight)
+        self.std = float(std)
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        command = self.command_manager
+        if not isinstance(command, BFMCommand):
+            raise TypeError("tracking_root_pos_exp requires BFMCommand")
+        current = command.asset.data.root_link_pos_w
+        target = command.env.episode_origin + command.ref_root_pos[:, 0]
+        error = (current - target).square().sum(dim=-1, keepdim=True)
+        return torch.exp(-error / self.std**2)
+
+
+class tracking_root_ori_exp(Reward):
+    """Exponential root-orientation match against the current reference frame."""
+
+    def __init__(self, weight: float, std: float = 0.4):
+        super().__init__(weight)
+        self.std = float(std)
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        command = self.command_manager
+        if not isinstance(command, BFMCommand):
+            raise TypeError("tracking_root_ori_exp requires BFMCommand")
+        current = command.asset.data.root_link_quat_w
+        target = command.ref_root_quat[:, 0]
+        delta = quat_mul(quat_conjugate(target), current)
+        error = axis_angle_from_quat(delta).square().sum(dim=-1, keepdim=True)
         return torch.exp(-error / self.std**2)
