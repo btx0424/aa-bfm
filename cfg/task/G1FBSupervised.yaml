@@ -1,0 +1,79 @@
+# @package task
+name: G1FBSupervised
+project: aa-bfm
+
+viewer:
+  resolution: [1280, 720]
+  lookat: [0., 0., 0.]
+  eye: [4.0, 4.0, 2.0]
+
+robot:
+  name: g1_waist_unlocked
+terrain: plane
+
+# common
+num_envs: 4096
+# BFMCommand replaces this per environment with the sampled clip length.
+max_episode_length: 1500
+
+sim:
+  step_dt: 0.02
+  isaac_physics_dt: 0.005
+  mujoco_physics_dt: 0.005
+
+input:
+  action:
+    _target_: JointPosition
+    action_scaling:
+      .*hip_pitch.*: 0.548
+      .*hip_roll.*: 0.351
+      .*hip_yaw.*: 0.548
+      .*knee.*: 0.351
+      waist_yaw_joint: 0.541
+      waist_roll_joint: 0.439
+      waist_pitch_joint: 0.439
+      .*ankle.*: 0.439
+      .*shoulder.*: 0.346
+      .*elbow_joint: 0.173
+      .*wrist_roll.*: 0.173
+      .*wrist_pitch.*: 0.293
+      .*wrist_yaw.*: 0.293
+    max_delay: 1
+    alpha_range: [1.0, 1.0]
+
+command:
+  _target_: BFMCommand
+  horizon: 8
+  reward_std: 0.5
+  fall_xy_thres: 0.8
+  ground_height: 0.4
+  clip_regex: ["walk.*"]
+
+observation:
+  command:
+    command: {}
+  policy:
+    root_angvel_b: {noise_std: 0.1}
+    root_linvel_b: {}
+    gravity_multistep: {steps: 1, noise_std: 0.05}
+    joint_pos_multistep: {joint_names: ".*", steps: 4, noise_std: 0.01}
+    joint_vel_multistep: {joint_names: ".*", steps: 4, noise_std: 0.5}
+    prev_actions: {steps: 1}
+
+reward:
+  track:
+    tracking_joint_exp: {weight: 1.0}
+  reg:
+    action_rate_l2: {weight: 0.01}
+    joint_torques_l2: {weight: 1.0e-5}
+
+termination:
+  max_episode_length: {}
+  crash:
+    body_names_expr:
+      - "pelvis"
+      - "torso_link"
+      - ".*_hip_.*_link"
+      - ".*shoulder_.*_link"
+      - ".*(wrist|elbow).*"
+  fall_over: {xy_thres: 0.8}

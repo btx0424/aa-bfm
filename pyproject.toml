@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aa_bfm"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "active_adaptation",
+]
+
+[project.entry-points."active_adaptation.projects"]
+aa_bfm = "aa_bfm"
+
+[project.entry-points."active_adaptation.learning"]
+aa_bfm = "aa_bfm_learning"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aa_bfm", "aa_bfm_learning"]
+
+[tool.setuptools.package-data]
+"*" = ["**/*"]
