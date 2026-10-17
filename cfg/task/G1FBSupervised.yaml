@@ -62,6 +62,13 @@ observation:
   # One kinematic frame. Slice this group over time to build the SMP window.
   smp_:
     smp_state: {}
+  # B reads this group as one vector: joint position, gravity, root angular velocity.
+  # Joint order is the simulation order of joint_pos. Reference frames are packed
+  # the same way in BFMCommand.ref_fb_state.
+  fb_state:
+    joint_pos: {joint_names: ".*"}
+    projected_gravity_b: {}
+    root_angvel_b: {}
 
 reward:
   track:

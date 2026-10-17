@@ -158,6 +158,11 @@ class BFMCommand(Command):
         self.ref_root_pos = torch.zeros(self.num_envs, self.num_lookahead, 3, device=self.device)
         self.ref_root_quat = torch.zeros(self.num_envs, self.num_lookahead, 4, device=self.device)
         self.ref_root_rot6d_b = torch.zeros(self.num_envs, self.num_lookahead, 6, device=self.device)
+        self.sim_joint_dim = joint_count
+        self.ref_fb_state = torch.zeros(
+            self.num_envs, self.num_lookahead, joint_count + 6, device=self.device
+        )
+        self._gravity = torch.tensor((0.0, 0.0, -1.0), device=self.device)
         self.cur_keypoint_pos = torch.zeros(self.num_envs, keypoint_count, 3, device=self.device)
         self.cur_keypoint_quat = torch.zeros(self.num_envs, keypoint_count, 4, device=self.device)
         self.cur_root_pos = torch.zeros(self.num_envs, 3, device=self.device)
@@ -244,6 +249,15 @@ class BFMCommand(Command):
         self.ref_keypoint_quat = self._gather(self.keypoint_quat, self._lookahead)
         self.ref_root_pos = self._gather(self.root_pos, self._lookahead)
         self.ref_root_quat = self._gather(self.root_quat, self._lookahead)
+        ref_joint = self._gather(self.joint_pos, self._lookahead)
+        joint_sim = ref_joint.new_zeros(self.num_envs, self.num_lookahead, self.sim_joint_dim)
+        joint_sim[..., self.asset_joint_index] = ref_joint
+        gravity = quat_rotate_inverse(
+            self.ref_root_quat, self._gravity.expand_as(self.ref_root_quat[..., :3])
+        )
+        ang_vel_w = self._gather(self.root_ang_vel, self._lookahead)
+        ang_vel_b = quat_rotate_inverse(self.ref_root_quat, ang_vel_w)
+        self.ref_fb_state = torch.cat((joint_sim, gravity, ang_vel_b), dim=-1)
         current_quat = self.asset.data.root_link_quat_w
         relative = quat_mul(quat_conjugate(current_quat.unsqueeze(1)), self.ref_root_quat)
         self.ref_root_rot6d_b = rot6d(relative)
