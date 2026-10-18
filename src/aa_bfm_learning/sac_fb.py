@@ -179,7 +179,7 @@ class SACFBConfig:
     bc_coef_nll: float = 0.05
 
     # ``fb_state`` is kept for B. It is not part of the SAC observation.
-    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY)
+    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY, PROMPT_KEY)
     # Paired FB. The actor still maximizes Q only.
     z_dim: int = 256
     fb_hidden_dim: int = 512

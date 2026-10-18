@@ -114,11 +114,23 @@ class BackwardMap(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.Tanh(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
             nn.Linear(hidden_dim, z_dim),
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Orthogonal weights so a random batch starts spread on the sphere.
+
+        ``project_z`` removes the scale of the last layer, so its gain is 1.
+        """
+        linears = [module for module in self.net if isinstance(module, nn.Linear)]
+        for linear in linears:
+            nn.init.orthogonal_(linear.weight, gain=0.1)
+            nn.init.zeros_(linear.bias)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         return project_z(self.net(state))
@@ -140,6 +152,21 @@ class ForwardMap(nn.Module):
                 for _ in range(num_parallel)
             ]
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Orthogonal hidden layers. The last layer is zero so ``F`` starts at 0.
+
+        Mish has no standard orthogonal gain; the ReLU gain is the closest one.
+        """
+        hidden_gain = nn.init.calculate_gain("relu")
+        for member in self.members:
+            linears = [module for module in member if isinstance(module, nn.Linear)]
+            for linear in linears[:-1]:
+                nn.init.orthogonal_(linear.weight, gain=hidden_gain)
+                nn.init.zeros_(linear.bias)
+            nn.init.zeros_(linears[-1].weight)
+            nn.init.zeros_(linears[-1].bias)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         inputs = torch.cat([state, action, z], dim=-1)

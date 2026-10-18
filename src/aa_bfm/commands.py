@@ -35,8 +35,12 @@ _KEYPOINT_NAMES = (
     "right_knee_link",
     "left_ankle_roll_link",
     "right_ankle_roll_link",
+    "left_shoulder_roll_link",
+    "right_shoulder_roll_link",
     "left_elbow_link",
     "right_elbow_link",
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
 )
 
 
