@@ -8,7 +8,8 @@ the reference window to choose the action and does not store ``z``.
 ``D`` sees only ``z``. Its positive samples are embeddings of dataset frames
 and its negative samples are embeddings of visited states, so the reward
 pushes the policy's embedding occupancy toward the dataset. ``Q_D`` is the
-critic of that reward. The actor ascends ``F^T z`` and ``Q_D``.
+critic of that reward. ``Q_R`` is the critic of the ``reg`` reward group.
+The actor ascends ``F^T z``, ``Q_D``, and ``Q_R``.
 
 The forward-backward residual is the UFO loss: squared off-diagonal successor
 measure, linear diagonal, and orthonormality on ``B``.
@@ -318,11 +319,20 @@ class FBPairedConfig:
     achieved_z_prob: float = 0.2
     lr_discriminator: float = 1.0e-5
     lr_q_d: float = 3.0e-4
-    # Actor weight on Q_D. ``scale_reg`` multiplies it by mean |F^T z|.
+    lr_q_r: float = 3.0e-4
+    # Actor weights. ``scale_reg`` multiplies both by mean |F^T z|.
     reg_coeff: float = 0.05
+    reg_coeff_aux: float = 0.02
+    reg_reward_group: str = "reg"
     scale_reg: bool = True
     grad_penalty: float = 10.0
     disc_hidden_dim: int = 256
+    # Added to the Q_D reward. ``log D - log(1-D)`` reaches about -14 at the
+    # probability clamp, so 14 keeps a fall from beating staying alive.
+    disc_reward_offset: float = 14.0
+    # Added to the reg-group reward for the same reason. Those terms are
+    # already negative costs.
+    reg_reward_offset: float = 1.0
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY, PROMPT_KEY)
 
@@ -389,12 +399,17 @@ class FBPaired(TensorDictModuleBase):
         self.Q_D = ForwardMap(
             self.obs_dim, self.act_dim, self.z_dim, cfg.hidden_dim, cfg.num_parallel, output_dim=1
         ).to(device)
+        self.Q_R = ForwardMap(
+            self.obs_dim, self.act_dim, self.z_dim, cfg.hidden_dim, cfg.num_parallel, output_dim=1
+        ).to(device)
         self.Q_D_target = copy.deepcopy(self.Q_D).requires_grad_(False).eval()
+        self.Q_R_target = copy.deepcopy(self.Q_R).requires_grad_(False).eval()
         self.opt_B = torch.optim.Adam(self.B.parameters(), lr=cfg.lr_b)
         self.opt_F = torch.optim.Adam(self.F.parameters(), lr=cfg.lr_f)
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr_actor)
         self.opt_D = torch.optim.Adam(self.D.parameters(), lr=cfg.lr_discriminator)
         self.opt_Q_D = torch.optim.Adam(self.Q_D.parameters(), lr=cfg.lr_q_d)
+        self.opt_Q_R = torch.optim.Adam(self.Q_R.parameters(), lr=cfg.lr_q_r)
 
         self._distributed = aa.is_distributed()
         if self._distributed:
@@ -403,15 +418,18 @@ class FBPaired(TensorDictModuleBase):
             self.actor = wrap_ddp(self.actor)
             self.D = wrap_ddp(self.D)
             self.Q_D = wrap_ddp(self.Q_D)
+            self.Q_R = wrap_ddp(self.Q_R)
             for module in (
                 self.B,
                 self.F,
                 self.actor,
                 self.D,
                 self.Q_D,
+                self.Q_R,
                 self.B_target,
                 self.F_target,
                 self.Q_D_target,
+                self.Q_R_target,
                 self.vecnorm_obs,
                 self.vecnorm_b,
             ):
@@ -480,6 +498,7 @@ class FBPaired(TensorDictModuleBase):
             z = self._mixed_z(batch)
             last = self._update_discriminator(batch)
             last.update(self._update_q_d(batch, z))
+            last.update(self._update_q_r(batch, z))
             last.update(self._update_fb(batch, z))
             last.update(self._update_actor(batch, z))
             if i == updates - 1:
@@ -487,6 +506,7 @@ class FBPaired(TensorDictModuleBase):
         soft_copy_(unwrap_ddp(self.F), self.F_target, tau=self.cfg.tau)
         soft_copy_(unwrap_ddp(self.B), self.B_target, tau=self.cfg.tau)
         soft_copy_(unwrap_ddp(self.Q_D), self.Q_D_target, tau=self.cfg.tau)
+        soft_copy_(unwrap_ddp(self.Q_R), self.Q_R_target, tau=self.cfg.tau)
         infos.update(self._prompt_check())
         infos["rb_size"] = float(len(self.rb))
         return infos
@@ -542,10 +562,15 @@ class FBPaired(TensorDictModuleBase):
         loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(self.D.parameters(), self.cfg.max_grad_norm)
         self.opt_D.step()
+        with torch.no_grad():
+            accuracy = 0.5 * (
+                (logits_data > 0).float().mean() + (logits_policy < 0).float().mean()
+            )
         return {
             "disc/loss": float(loss.detach()),
             "disc/data": float(loss_data.mean().detach()),
             "disc/policy": float(loss_policy.mean().detach()),
+            "disc/acc": float(accuracy),
             "disc/penalty": float(penalty.detach()),
             "disc/grad_norm": float(grad_norm),
         }
@@ -565,7 +590,7 @@ class FBPaired(TensorDictModuleBase):
         discount = self._discount(batch).squeeze(-1)
         with torch.no_grad():
             achieved = self._encode_fb(batch["next", FB_KEY])
-            reward = unwrap_ddp(self.D).reward(achieved)
+            reward = unwrap_ddp(self.D).reward(achieved) + self.cfg.disc_reward_offset
             next_action = self._sample_action(next_obs, z, mean=False)
             next_q = uncertainty_target(
                 self.Q_D_target(next_obs, next_action, z),
@@ -583,6 +608,41 @@ class FBPaired(TensorDictModuleBase):
             "qd/q": float(q.mean().detach()),
             "qd/reward": float(reward.mean().detach()),
             "qd/grad_norm": float(grad_norm),
+        }
+
+    def _reg_reward(self, batch: TensorDict) -> torch.Tensor:
+        group = self.cfg.reg_reward_group
+        try:
+            reward = batch["next", "reward", group]
+        except KeyError as exc:
+            raise KeyError(f"fb_paired Q_R requires reward group {group!r}.") from exc
+        return reward.sum(dim=-1)
+
+    def _update_q_r(self, batch: TensorDict, z: torch.Tensor) -> dict[str, float]:
+        """Bellman backup of the ``reg`` reward group. Weights are already in the env."""
+        obs = self._normalize_obs(batch[OBS_KEY])
+        next_obs = self._normalize_obs(batch["next", OBS_KEY])
+        action = batch[ACTION_KEY]
+        discount = self._discount(batch).squeeze(-1)
+        with torch.no_grad():
+            reward = self._reg_reward(batch) + self.cfg.reg_reward_offset
+            next_action = self._sample_action(next_obs, z, mean=False)
+            next_q = uncertainty_target(
+                self.Q_R_target(next_obs, next_action, z),
+                self.cfg.actor_pessimism,
+            )
+            target = reward + discount * next_q
+        q = self.Q_R(obs, action, z)
+        loss = F.mse_loss(q.float(), target.float().unsqueeze(0).expand_as(q))
+        self.opt_Q_R.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(self.Q_R.parameters(), self.cfg.max_grad_norm)
+        self.opt_Q_R.step()
+        return {
+            "qr/loss": float(loss.detach()),
+            "qr/q": float(q.mean().detach()),
+            "qr/reward": float(reward.mean().detach()),
+            "qr/grad_norm": float(grad_norm),
         }
 
     def _mixed_z(self, batch: TensorDict) -> torch.Tensor:
@@ -691,10 +751,15 @@ class FBPaired(TensorDictModuleBase):
         action = self._sample_action(obs, z, mean=False)
         features = self.F(obs, action, z)
         q_fb = uncertainty_target((features * z).sum(-1), self.cfg.actor_pessimism)
-        with hold_out_net(self.Q_D):
+        with hold_out_net(self.Q_D), hold_out_net(self.Q_R):
             q_d = uncertainty_target(self.Q_D(obs, action, z), self.cfg.actor_pessimism)
+            q_r = uncertainty_target(self.Q_R(obs, action, z), self.cfg.actor_pessimism)
             weight = q_fb.abs().mean().detach() if self.cfg.scale_reg else q_fb.new_ones(())
-            loss = -(q_fb.mean() + self.cfg.reg_coeff * weight * q_d.mean())
+            loss = -(
+                q_fb.mean()
+                + self.cfg.reg_coeff * weight * q_d.mean()
+                + self.cfg.reg_coeff_aux * weight * q_r.mean()
+            )
             self.opt_actor.zero_grad(set_to_none=True)
             loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
@@ -704,6 +769,7 @@ class FBPaired(TensorDictModuleBase):
             "actor/loss": float(loss.detach()),
             "actor/q": float(q_fb.mean().detach()) / scale,
             "actor/q_d": float(q_d.mean().detach()),
+            "actor/q_r": float(q_r.mean().detach()),
             "actor/grad_norm": float(grad_norm),
         }
 
@@ -766,6 +832,7 @@ class FBPaired(TensorDictModuleBase):
             "actor": unwrap_ddp(self.actor).state_dict(),
             "D": unwrap_ddp(self.D).state_dict(),
             "Q_D": unwrap_ddp(self.Q_D).state_dict(),
+            "Q_R": unwrap_ddp(self.Q_R).state_dict(),
             "vecnorm_obs": self.vecnorm_obs.state_dict(),
             "vecnorm_b": self.vecnorm_b.state_dict(),
         }
@@ -778,6 +845,9 @@ class FBPaired(TensorDictModuleBase):
             unwrap_ddp(self.D).load_state_dict(state_dict["D"], strict=strict)
             unwrap_ddp(self.Q_D).load_state_dict(state_dict["Q_D"], strict=strict)
             self.Q_D_target.load_state_dict(unwrap_ddp(self.Q_D).state_dict())
+        if "Q_R" in state_dict:
+            unwrap_ddp(self.Q_R).load_state_dict(state_dict["Q_R"], strict=strict)
+            self.Q_R_target.load_state_dict(unwrap_ddp(self.Q_R).state_dict())
         self.vecnorm_obs.load_state_dict(state_dict["vecnorm_obs"])
         self.vecnorm_b.load_state_dict(state_dict["vecnorm_b"])
         self.B_target.load_state_dict(unwrap_ddp(self.B).state_dict())
