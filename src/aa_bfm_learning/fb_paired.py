@@ -1,9 +1,9 @@
 """Fully paired forward-backward training.
 
-The prompt for a step is the normalized mean of ``B`` over the reference
-lookahead of the clip that reset the episode. That same prompt is stored and
-reused for ``F``, ``B``, and the actor. There is no discriminator, auxiliary
-critic, or task relabeling.
+``z`` is re-encoded from the ``fb_prompt`` observation with the current ``B``
+on every update, for ``F`` and for the actor. The rollout encodes the same
+window only to choose the action; it does not store ``z``. There is no
+discriminator, auxiliary critic, or task relabeling.
 
 The forward-backward residual is the UFO loss: squared off-diagonal successor
 measure, linear diagonal, and orthonormality on ``B``.
@@ -36,10 +36,61 @@ if TYPE_CHECKING:
 cs = ConfigStore.instance()
 
 FB_KEY = "fb_state"
+PROMPT_KEY = "fb_prompt"
 
 
 def project_z(z: torch.Tensor) -> torch.Tensor:
     return math.sqrt(z.shape[-1]) * F.normalize(z, dim=-1)
+
+
+def _fb_logs(
+    *,
+    z_dim: int,
+    ortho_coef: float,
+    q_loss_coef: float,
+    offdiag: torch.Tensor,
+    diag: torch.Tensor,
+    orth_off: torch.Tensor,
+    orth_diag: torch.Tensor,
+    q_loss: torch.Tensor,
+    q_value: torch.Tensor,
+    q_std: torch.Tensor,
+    q_disagreement: torch.Tensor,
+    m_diag: torch.Tensor,
+    discount: torch.Tensor,
+    grad_norm_f: torch.Tensor,
+    grad_norm_b: torch.Tensor,
+) -> dict[str, float]:
+    """Log FB quantities per unit of ``z_dim``.
+
+    ``project_z`` fixes ``||B|| = ||z|| = sqrt(z_dim)``, so a feature dot is
+    at most ``z_dim`` and a square of dots grows as ``z_dim**2``. Dividing
+    those out makes the logs comparable across embedding sizes. The optimized
+    loss is still the unscaled sum. Gradient norms are the raw clip inputs.
+    """
+    scale = float(z_dim)
+    square = scale * scale
+    # ``orth_diag`` is exactly ``-z_dim`` because ``||B||^2`` is fixed.
+    loss = (
+        offdiag / square
+        + diag / scale
+        + ortho_coef * (orth_off / square + orth_diag / scale)
+        + q_loss_coef * q_loss / square
+    )
+    return {
+        "fb/loss": float(loss.detach()),
+        "fb/offdiag": float((offdiag / square).detach()),
+        "fb/diag": float((diag / scale).detach()),
+        "fb/orth_off": float((orth_off / square).detach()),
+        "fb/q_value": float((q_value / scale).detach()),
+        "fb/q_std": float((q_std / scale).detach()),
+        "fb/q_disagreement": float((q_disagreement / scale).detach()),
+        "fb/m_diag": float((m_diag / scale).detach()),
+        "fb/discount": float(discount.detach()),
+        "fb/q_loss": float((q_loss / square).detach()),
+        "fb/grad_norm_F": float(grad_norm_f),
+        "fb/grad_norm_B": float(grad_norm_b),
+    }
 
 
 def uncertainty_target(preds: torch.Tensor, pessimism: float) -> torch.Tensor:
@@ -137,7 +188,7 @@ class FBPairedConfig:
     q_loss_coef: float = 1.0
     max_grad_norm: float = 5.0
 
-    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY)
+    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY, PROMPT_KEY)
 
     def get_class(self):
         return FBPaired
@@ -165,12 +216,18 @@ class FBPaired(TensorDictModuleBase):
             raise KeyError(f"fb_paired requires an observation group {OBS_KEY!r}.")
         if FB_KEY not in observation_spec.keys(True, True):
             raise KeyError(f"fb_paired requires an observation group {FB_KEY!r}.")
+        if PROMPT_KEY not in observation_spec.keys(True, True):
+            raise KeyError(f"fb_paired requires an observation group {PROMPT_KEY!r}.")
         self.cfg = cfg
         self.device = device
         self.command_manager = command_manager
         fake = observation_spec.zero()
         self.obs_dim = int(fake[OBS_KEY].shape[-1])
         self.b_dim = int(fake[FB_KEY].shape[-1])
+        prompt_dim = int(fake[PROMPT_KEY].shape[-1])
+        if prompt_dim % self.b_dim != 0:
+            raise ValueError(f"fb_prompt dim {prompt_dim} is not a multiple of fb_state dim {self.b_dim}")
+        self.prompt_horizon = prompt_dim // self.b_dim
         self.act_dim = int(action_spec.shape[-1])
         self.z_dim = int(cfg.z_dim)
         if cfg.num_parallel < 1:
@@ -225,10 +282,7 @@ class FBPaired(TensorDictModuleBase):
     def on_stage_start(self, stage: str, env: _EnvBase):
         del stage
         fake = env.fake_tensordict().exclude(("next", "stats"), "collector")
-        shape = fake.shape
-        fake["z"] = torch.zeros(*shape, self.z_dim, device=fake.device)
         observation_keys = set(env.observation_spec.keys(True, True))
-        observation_keys.add("z")
         self.rb = ReplayBuffer.from_fake(
             self.cfg.buffer_size,
             fake,
@@ -267,6 +321,7 @@ class FBPaired(TensorDictModuleBase):
                 infos.update(last)
         soft_copy_(unwrap_ddp(self.F), self.F_target, tau=self.cfg.tau)
         soft_copy_(unwrap_ddp(self.B), self.B_target, tau=self.cfg.tau)
+        infos.update(self._prompt_check())
         infos["rb_size"] = float(len(self.rb))
         return infos
 
@@ -300,7 +355,9 @@ class FBPaired(TensorDictModuleBase):
         state = self._normalize_b(batch[FB_KEY])
         next_state = self._normalize_b(batch["next", FB_KEY])
         action = batch[ACTION_KEY]
-        z = batch["z"]
+        # Current ``B`` on the stored reference window. Detach so the loss
+        # cannot move the prompt to shrink the residual.
+        z = self._encode_prompt(batch[PROMPT_KEY])
         discount = self._discount(batch)
         batch_size = state.shape[0]
         eye = torch.eye(batch_size, device=state.device)
@@ -319,24 +376,12 @@ class FBPaired(TensorDictModuleBase):
         pred_f = self.F(obs, action, z)
         pred_b = self.B(next_state)
         pred_m = torch.matmul(pred_f, pred_b.transpose(-1, -2))
-        # Scale each transition's successor row. ``discount`` is (batch, 1).
-        #
-        # Scales for z_dim=256, batch=512, 2 heads, gamma=0.98. ``project_z``
-        # fixes ``||B|| = ||z|| = 16``, so these losses are not comparable.
-        #   orth_diag = -||B||^2 = -256, exactly, every step.
-        #   orth_off = 0.5 * mean_{i≠j} (B_i·B_j)^2. Random embeddings give
-        #   ~128 (RMS cosine ~0.5; thousands means they are still aligned).
-        #   The isotropic floor is ~64 and it cannot fall to 0: 512 vectors in
-        #   256-d must have residual dots. ~200 is RMS cosine ~0.08.
-        #   offdiag = 0.5 * mean_{i≠j} (M_ij - γ M'_ij)^2. It ignores the
-        #   diagonal. RMS residual 1 → ~0.5; RMS residual 10 → 50. A fit is
-        #   single digits to low tens. Small offdiag does not mean Q is right.
-        #   diag = -mean_i(M_ii - γ M'_ii) * num_heads. A one-step residual of
-        #   +1, the successor-measure "reward", gives diag ≈ +2. Hundreds means
-        #   the self-entry misses the bootstrap by hundreds. Large negative
-        #   means M_ii is above its bootstrap.
-        #   m_diag = mean F·B. A successor self-entry is O(1/(1-γ)) = O(50)
-        #   when the implicit reward is O(1). Thousands means F has left that scale.
+        # ``discount`` is (batch, 1). Logs are scaled in ``_fb_logs``: a dot
+        # by ``z_dim``, a mean square by ``z_dim**2``. ``orth_off`` is then
+        # ``0.5 * mean cosine^2`` (random ≈ ``0.5/z_dim``; it cannot fall to 0).
+        # ``q_value`` and ``m_diag`` are dots over ``z_dim``, so a perfect
+        # feature match every step is ``1/(1-γ)``. ``q_loss`` is the MSE of
+        # that scaled return.
         diff = pred_m - discount.view(1, -1, 1) * target_m.unsqueeze(0)
         fb_offdiag = 0.5 * (diff * off_diag).square().sum() / off_diag_sum
         fb_diag = -torch.diagonal(diff, dim1=-2, dim2=-1).mean() * diff.shape[0]
@@ -354,16 +399,6 @@ class FBPaired(TensorDictModuleBase):
             reward = (solved * z.float()).sum(-1)
             q_target = reward + discount.squeeze(-1) * next_q
         q_pred = (pred_f * z).sum(-1)
-        # q_loss = 0.5 * num_heads * MSE = MSE at num_heads=2, so the log is
-        # the squared Bellman residual and RMSE is sqrt(q_loss).
-        # With Σ_B ≈ I, the one-step reward is B·z ∈ [-256, 256] (256 is a
-        # perfect feature match, ~16 is a random dot). A true return is then
-        # at most 256/(1-γ) = 12800, and a modest match (reward ~80) sits
-        # near 4000. q_value in the thousands is inside that range only while
-        # q_loss is small. A fit has RMSE of a few to a few tens, so q_loss
-        # of ~10–1000. 5e4 is RMSE ~224, a whole reward; 6e5 is RMSE ~775,
-        # larger than any legal one-step reward. coef 0 leaves it there.
-        # fb/loss does not contain this term unless q_loss_coef > 0.
         q_loss = 0.5 * pred_f.shape[0] * F.mse_loss(q_pred, q_target.unsqueeze(0).expand_as(q_pred))
         loss = loss + self.cfg.q_loss_coef * q_loss
 
@@ -381,44 +416,86 @@ class FBPaired(TensorDictModuleBase):
             q_behavior = q_heads.mean(dim=0)
             q_disagreement = (q_heads - q_behavior.unsqueeze(0)).abs().mean()
             m_diag = torch.diagonal(pred_m, dim1=-2, dim2=-1).mean()
-        metrics = {
-            "fb/loss": float(loss.detach()),
-            "fb/offdiag": float(fb_offdiag.detach()),
-            "fb/diag": float(fb_diag.detach()),
-            "fb/orth_off": float(orth_off.detach()),
-            "fb/q_value": float(q_behavior.mean()),
-            "fb/q_std": float(q_behavior.std()),
-            "fb/q_disagreement": float(q_disagreement),
-            "fb/m_diag": float(m_diag),
-            "fb/discount": float(discount.mean()),
-            "fb/grad_norm_F": float(grad_norm_F),
-            "fb/grad_norm_B": float(grad_norm_B),
-        }
-        metrics["fb/q_loss"] = float(q_loss.detach())
-        return metrics
+        return _fb_logs(
+            z_dim=self.z_dim,
+            ortho_coef=self.cfg.ortho_coef,
+            q_loss_coef=self.cfg.q_loss_coef,
+            offdiag=fb_offdiag,
+            diag=fb_diag,
+            orth_off=orth_off,
+            orth_diag=orth_diag,
+            q_loss=q_loss,
+            q_value=q_behavior.mean(),
+            q_std=q_behavior.std(),
+            q_disagreement=q_disagreement,
+            m_diag=m_diag,
+            discount=discount.mean(),
+            grad_norm_f=grad_norm_F,
+            grad_norm_b=grad_norm_B,
+        )
 
     def _update_actor(self, batch: TensorDict) -> dict[str, float]:
         obs = self._normalize_obs(batch[OBS_KEY])
-        z = batch["z"]
+        z = self._encode_prompt(batch[PROMPT_KEY])
         action = self._sample_action(obs, z, mean=False)
         features = self.F(obs, action, z)
-        # actor/q is F(s, a_π, z)^T z after pessimism, same units as fb/q_value
-        # (hundreds to a few thousand; ceiling ~12800 for a perfect B·z every
-        # step). actor/loss = -actor/q, so a large negative loss is a large Q.
         q = uncertainty_target((features * z).sum(-1), self.cfg.actor_pessimism)
         loss = -q.mean()
         self.opt_actor.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.opt_actor.step()
+        # Same units as ``fb/q_value``. The optimized loss is still ``-F^T z``.
+        scale = float(self.z_dim)
         return {
-            "actor/loss": float(loss.detach()),
-            "actor/q": float(q.mean().detach()),
+            "actor/loss": float(loss.detach()) / scale,
+            "actor/q": float(q.mean().detach()) / scale,
             "actor/grad_norm": float(grad_norm),
         }
 
+    def _prompt_frames(self, prompt: torch.Tensor) -> torch.Tensor:
+        return prompt.reshape(*prompt.shape[:-1], self.prompt_horizon, self.b_dim)
+
+    def _encode_prompt(self, prompt: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self.encode_reference(self._prompt_frames(prompt))
+
+    @torch.no_grad()
+    def _prompt_check(self) -> dict[str, float]:
+        """Cosine of ``z`` from the reference window and from the visited frames.
+
+        The prompt at ``t`` is ``fb_state`` of the reference at ``t+1..t+H``.
+        The matching visit is ``next fb_state`` along the next ``H`` transitions.
+        Windows that hit ``done`` are dropped: the replay stitch repeats the
+        terminal observation there, so it is not the motion.
+        """
+        horizon = self.prompt_horizon
+        if self.rb is None or len(self.rb) < horizon + 1:
+            return {}
+        segment = self.rb.sample_trajectory(
+            batch_size=min(256, self.cfg.fb_batch_size),
+            steps=horizon,
+            next_obs=True,
+        ).to(self.device)
+        done = segment["next", "done"].bool()
+        while done.ndim > 2:
+            done = done.squeeze(-1)
+        valid = ~done.any(dim=0)
+        z_ref = self.encode_reference(self._prompt_frames(segment[0][PROMPT_KEY]))
+        visited = segment["next", FB_KEY].transpose(0, 1).contiguous()
+        z_visited = self.encode_reference(visited)
+        cosine = F.cosine_similarity(z_ref, z_visited, dim=-1)
+        if bool(valid.any()):
+            agreement = cosine[valid].mean()
+        else:
+            agreement = cosine.new_zeros(())
+        return {
+            "fb/prompt_cos": float(agreement),
+            "fb/prompt_valid": float(valid.float().mean()),
+        }
+
     def encode_reference(self, ref_state: torch.Tensor) -> torch.Tensor:
-        """``z = Π(mean_h B(s_ref))`` over ``BFMCommand.ref_fb_state``."""
+        """``z = Π(mean_h B(frames))`` for a window in the ``fb_state`` layout."""
         if ref_state.shape[-1] != self.b_dim:
             raise ValueError(f"ref_fb_state dim {ref_state.shape[-1]} != fb_state group {self.b_dim}")
         flat = self.vecnorm_b(ref_state.reshape(-1, self.b_dim))
@@ -451,15 +528,14 @@ class FBRolloutPolicy(TensorDictModuleBase):
         super().__init__()
         object.__setattr__(self, "algo", algo)
         self.eval_mode = False
-        self.in_keys = [OBS_KEY, FB_KEY]
-        self.out_keys = [ACTION_KEY, "z"]
+        self.in_keys = [OBS_KEY, FB_KEY, PROMPT_KEY]
+        self.out_keys = [ACTION_KEY]
 
     def forward(self, tensordict: TensorDict) -> TensorDict:
         algo = self.algo
         obs = algo.vecnorm_obs(tensordict[OBS_KEY])
         algo.vecnorm_b(tensordict[FB_KEY])
-        z = algo.encode_reference(algo.command_manager.ref_fb_state)
+        z = algo._encode_prompt(tensordict[PROMPT_KEY])
         mean = self.eval_mode or exploration_type() == ExplorationType.MODE
         tensordict[ACTION_KEY] = algo._sample_action(obs, z, mean=mean)
-        tensordict["z"] = z
         return tensordict

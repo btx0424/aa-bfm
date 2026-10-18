@@ -69,6 +69,10 @@ observation:
     joint_pos: {joint_names: ".*"}
     projected_gravity_b: {}
     root_angvel_b: {}
+  # Reference lookahead in the fb_state layout. The FB update re-encodes this
+  # with the current B. It is not an actor input.
+  fb_prompt:
+    fb_prompt: {}
 
 reward:
   track:

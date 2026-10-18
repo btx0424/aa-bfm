@@ -2,7 +2,8 @@
 
 The actor and critic are the quadmanip SAC RLPD trainer without symmetry
 augmentation. ``F`` and ``B`` train on the behavior data and do not enter
-the actor loss. The prompt ``z`` is the reference embedding stored at rollout.
+the actor loss. ``z`` is re-encoded from the ``fb_prompt`` observation with
+the current ``B`` on every update. The rollout does not store it.
 """
 
 from __future__ import annotations
@@ -71,6 +72,8 @@ from .fb_paired import (
     FB_KEY,
     BackwardMap,
     ForwardMap,
+    _fb_logs,
+    PROMPT_KEY,
     project_z,
     uncertainty_target,
 )
@@ -240,6 +243,8 @@ class SACFB(TensorDictModuleBase):
             raise TypeError("sac_fb requires BFMCommand.ref_fb_state.")
         if FB_KEY not in observation_spec.keys(True, True):
             raise KeyError(f"sac_fb requires an observation group {FB_KEY!r}.")
+        if PROMPT_KEY not in observation_spec.keys(True, True):
+            raise KeyError(f"sac_fb requires an observation group {PROMPT_KEY!r}.")
         if OBS_KEY not in observation_spec.keys(True, True):
             raise KeyError(f"sac_fb requires an observation group {OBS_KEY!r}.")
         # ``fb_state`` is kept on the env by ``in_keys``, then dropped here so
@@ -384,6 +389,10 @@ class SACFB(TensorDictModuleBase):
         fake_fb = observation_spec.zero()
         self.fb_obs_dim = int(fake_fb[OBS_KEY].shape[-1])
         self.b_dim = int(fake_fb[FB_KEY].shape[-1])
+        prompt_dim = int(fake_fb[PROMPT_KEY].shape[-1])
+        if prompt_dim % self.b_dim != 0:
+            raise ValueError(f"fb_prompt dim {prompt_dim} is not a multiple of fb_state dim {self.b_dim}")
+        self.prompt_horizon = prompt_dim // self.b_dim
         self.z_dim = int(cfg.z_dim)
         self.vecnorm_fb_obs = VecNorm(self.fb_obs_dim).to(device)
         self.vecnorm_b = VecNorm(self.b_dim).to(device)
@@ -527,9 +536,7 @@ class SACFB(TensorDictModuleBase):
             .exclude(("next", "stats"), "collector")
         )
         fake_rb["loc"] = torch.zeros(fake_rb.shape[0], self.actor.act_dim)
-        fake_rb["z"] = torch.zeros(*fake_rb.shape, self.z_dim, device=fake_rb.device)
         observation_keys = set(env.observation_spec.keys(True, True))
-        observation_keys.add("z")
         observation_keys = observation_keys - {"prev_noise", "rho"}
         self.rb = ReplayBuffer.from_fake(
             self.cfg.buffer_size, fake_rb,
@@ -623,12 +630,13 @@ class SACFB(TensorDictModuleBase):
                 device=self.device,
             )
             d = i == critic_iters - 1
-            # One-step FB on the online row. Prior rows have no reference ``z``.
+            # One-step FB on the online row. Prior rows have no ``fb_prompt``.
             fb_step = batch[0] if batch.batch_dims >= 2 else batch
             fb_info = self._update_fb(fb_step.clone())
             info = self.train_critic(batch, batch_prior=batch_prior, diagnostics=d)
         infos.update(info)
         infos.update(fb_info)
+        infos.update(self._prompt_check())
         soft_copy_(unwrap_ddp(self.F), self.F_target, tau=self.cfg.tau_fb)
         soft_copy_(unwrap_ddp(self.B), self.B_target, tau=self.cfg.tau_fb)
 
@@ -1080,7 +1088,10 @@ class SACFB(TensorDictModuleBase):
         next_obs = self.vecnorm_fb_obs(batch["next", OBS_KEY])
         next_state = self.vecnorm_b(batch["next", FB_KEY])
         action = batch[ACTION_KEY]
-        z = batch["z"]
+        # Re-encode the reference window stored at this step with the current
+        # ``B``, then detach. A rollout ``z`` would be the embedding from
+        # collection time, and the loss must not train ``B`` through the prompt.
+        z = self.encode_reference(self._prompt_frames(batch[PROMPT_KEY])).detach()
         terminated = batch["next", "terminated"].float()
         discount = batch["next", "discount"] * (1.0 - terminated) * self.cfg.gamma
         batch_size = next_state.shape[0]
@@ -1133,23 +1144,63 @@ class SACFB(TensorDictModuleBase):
             q_behavior = q_heads.mean(dim=0)
             q_disagreement = (q_heads - q_behavior.unsqueeze(0)).abs().mean()
             m_diag = torch.diagonal(pred_m, dim1=-2, dim2=-1).mean()
+        return _fb_logs(
+            z_dim=self.z_dim,
+            ortho_coef=self.cfg.ortho_coef,
+            q_loss_coef=self.cfg.q_loss_coef,
+            offdiag=fb_offdiag,
+            diag=fb_diag,
+            orth_off=orth_off,
+            orth_diag=orth_diag,
+            q_loss=q_loss,
+            q_value=q_behavior.mean(),
+            q_std=q_behavior.std(),
+            q_disagreement=q_disagreement,
+            m_diag=m_diag,
+            discount=discount.mean(),
+            grad_norm_f=grad_norm_F,
+            grad_norm_b=grad_norm_B,
+        )
+
+    def _prompt_frames(self, prompt: torch.Tensor) -> torch.Tensor:
+        return prompt.reshape(*prompt.shape[:-1], self.prompt_horizon, self.b_dim)
+
+    @torch.no_grad()
+    def _prompt_check(self) -> dict[str, float]:
+        """Cosine of ``z`` from the reference window and from the visited frames.
+
+        The prompt at ``t`` is ``fb_state`` of the reference at ``t+1..t+H``.
+        The matching visit is ``next fb_state`` along the next ``H`` transitions.
+        Windows that hit ``done`` are dropped: the replay stitch repeats the
+        terminal observation there, so it is not the motion.
+        """
+        horizon = self.prompt_horizon
+        if len(self.rb) < horizon + 1:
+            return {}
+        segment = self.rb.sample_trajectory(
+            batch_size=256,
+            steps=horizon,
+            next_obs=True,
+        ).to(self.device)
+        done = segment["next", "done"].bool()
+        while done.ndim > 2:
+            done = done.squeeze(-1)
+        valid = ~done.any(dim=0)
+        z_ref = self.encode_reference(self._prompt_frames(segment[0][PROMPT_KEY]))
+        visited = segment["next", FB_KEY].transpose(0, 1).contiguous()
+        z_visited = self.encode_reference(visited)
+        cosine = F.cosine_similarity(z_ref, z_visited, dim=-1)
+        if bool(valid.any()):
+            agreement = cosine[valid].mean()
+        else:
+            agreement = cosine.new_zeros(())
         return {
-            "fb/loss": float(loss.detach()),
-            "fb/offdiag": float(fb_offdiag.detach()),
-            "fb/diag": float(fb_diag.detach()),
-            "fb/orth_off": float(orth_off.detach()),
-            "fb/q_value": float(q_behavior.mean()),
-            "fb/q_std": float(q_behavior.std()),
-            "fb/q_disagreement": float(q_disagreement),
-            "fb/m_diag": float(m_diag),
-            "fb/discount": float(discount.mean()),
-            "fb/q_loss": float(q_loss.detach()),
-            "fb/grad_norm_F": float(grad_norm_F),
-            "fb/grad_norm_B": float(grad_norm_B),
+            "fb/prompt_cos": float(agreement),
+            "fb/prompt_valid": float(valid.float().mean()),
         }
 
     def encode_reference(self, ref_state: torch.Tensor) -> torch.Tensor:
-        """``z = Π(mean_h B(s_ref))`` over ``BFMCommand.ref_fb_state``."""
+        """``z = Π(mean_h B(frames))`` for a window in the ``fb_state`` layout."""
         if ref_state.shape[-1] != self.b_dim:
             raise ValueError(f"ref_fb_state dim {ref_state.shape[-1]} != fb_state group {self.b_dim}")
         flat = self.vecnorm_b(ref_state.reshape(-1, self.b_dim))
@@ -1195,7 +1246,7 @@ class SACFB(TensorDictModuleBase):
 
 
 class SACFBRolloutPolicy(TensorDictModuleBase):
-    """SAC rollout, plus the reference prompt stored for the FB update."""
+    """SAC rollout. Updates ``B``'s normalizer on the robot state and the prompt."""
 
     def __init__(self, policy: TensorDictModuleBase, algo: SACFB, eval_mode: bool):
         super().__init__()
@@ -1203,20 +1254,21 @@ class SACFBRolloutPolicy(TensorDictModuleBase):
         self.algo = algo
         self.eval_mode = eval_mode
         self.in_keys = list(policy.in_keys)
-        self.out_keys = list(policy.out_keys) + ["z"]
+        self.out_keys = list(policy.out_keys)
 
     def forward(self, tensordict: TensorDict) -> TensorDict:
         algo = self.algo
         if self.eval_mode:
             with VecNorm.freeze():
-                self._write_z(algo, tensordict)
+                self._update_fb_norm(algo, tensordict)
                 return self.policy(tensordict)
-        self._write_z(algo, tensordict)
+        self._update_fb_norm(algo, tensordict)
         return self.policy(tensordict)
 
     @staticmethod
-    def _write_z(algo: SACFB, tensordict: TensorDict) -> None:
+    def _update_fb_norm(algo: SACFB, tensordict: TensorDict) -> None:
         algo.vecnorm_fb_obs(tensordict[OBS_KEY])
         algo.vecnorm_b(tensordict[FB_KEY])
-        tensordict["z"] = algo.encode_reference(algo.command_manager.ref_fb_state)
+        # Reference frames share ``B``'s normalizer with the robot state.
+        algo.vecnorm_b(tensordict[PROMPT_KEY].reshape(-1, algo.b_dim))
 

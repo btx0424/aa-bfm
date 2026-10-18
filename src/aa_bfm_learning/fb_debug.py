@@ -190,6 +190,7 @@ class FBDebug(FBPaired):
         soft_copy_(unwrap_ddp(self.B), self.B_target, tau=self.cfg.tau)
         soft_copy_(unwrap_ddp(self.actor), self.actor_target, tau=self.cfg.tau_actor)
         soft_copy_(unwrap_ddp(self.Q), self.Q_target, tau=self.cfg.tau)
+        infos.update(self._prompt_check())
         infos["rb_size"] = float(len(self.rb))
         return infos
 
@@ -310,7 +311,7 @@ class FBDebug(FBPaired):
         obs = self._normalize_obs(batch[OBS_KEY])
         command = self._normalize_cmd(batch[CMD_KEY])
         self._action_command = command.detach()
-        action = self._sample_action(obs, batch["z"], mean=False)
+        action = self._sample_action(obs, command, mean=False)
         with hold_out_net(self.Q):
             q = uncertainty_target(self.Q(obs, command, action), self.cfg.task_pessimism)
             loss = -q.mean()

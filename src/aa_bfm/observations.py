@@ -83,6 +83,49 @@ def _tan_norm(quat: torch.Tensor) -> torch.Tensor:
     return torch.cat((mat[..., :, 0], mat[..., :, 2]), dim=-1)
 
 
+class fb_prompt(Observation):
+    """Reference lookahead in the ``fb_state`` layout, frames concatenated.
+
+    ``BFMCommand.ref_fb_state`` is ``(N, H, b_dim)`` for the configured
+    lookahead offsets. Flattening it into this group puts that window in the
+    replay buffer, so an update can run the current ``B`` over it instead of
+    trusting the ``z`` stored at rollout.
+    """
+
+    @override
+    def _initialize(self, env) -> None:
+        super()._initialize(env)
+        command = self.command_manager
+        if not isinstance(command, BFMCommand):
+            raise TypeError("fb_prompt requires BFMCommand")
+        self.command = command
+        self.asset = command.asset
+        self.joint_names = list(command.asset.joint_names)
+        self.horizon = int(command.num_lookahead)
+        frame_dim = int(command.ref_fb_state.shape[-1])
+        if frame_dim != len(self.joint_names) + 6:
+            raise ValueError(
+                f"ref_fb_state frame is {frame_dim}, expected "
+                f"{len(self.joint_names)} joints + gravity + angular velocity"
+            )
+
+    @override
+    def compute(self) -> torch.Tensor:
+        return self.command.ref_fb_state.reshape(self.num_envs, -1)
+
+    @override
+    def symmetry_transform(self) -> SymmetryTransform:
+        """Mirror each lookahead frame: joints, then gravity, then angular velocity."""
+        frame = SymmetryTransform.cat(
+            [
+                joint_space_symmetry(self.asset, self.joint_names),
+                SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([1.0, -1.0, 1.0])),
+                SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([-1.0, 1.0, -1.0])),
+            ]
+        )
+        return frame.repeat(self.horizon)
+
+
 class smp_state(Observation):
     """Current G1 kinematics, one frame, episode-origin relative.
 
