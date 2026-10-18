@@ -174,6 +174,7 @@ class BFMCommand(Command):
                 f"Simulation joint order has {len(self.fb_joint_names)} names, "
                 f"but joint_pos has {joint_count}"
             )
+        self._pack_fb_frames()
         self._clip_flags()
 
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -197,9 +198,8 @@ class BFMCommand(Command):
         self.cur_root_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.cur_root_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.sim_joint_dim = joint_count
-        # joint pos, joint vel, gravity, angular velocity, linear velocity.
-        self.ref_fb_state = torch.zeros(
-            self.num_envs, self.num_lookahead, 2 * joint_count + 9, device=self.device
+        self.ref_fb_index = torch.zeros(
+            self.num_envs, self.num_lookahead, dtype=torch.long, device=self.device
         )
         self._gravity = torch.tensor((0.0, 0.0, -1.0), device=self.device)
         self.cur_keypoint_pos = torch.zeros(self.num_envs, keypoint_count, 3, device=self.device)
@@ -283,6 +283,35 @@ class BFMCommand(Command):
         self._load_lookahead()
         return origins
 
+    def _lookahead_index(self) -> torch.Tensor:
+        """Flat ``fb_frames`` index of each lookahead step. ``(num_envs, H)``."""
+        local = self.t.unsqueeze(1) + self._lookahead
+        limit = (self.lengths[self.motion_ids] - 1).unsqueeze(1).clamp(min=0)
+        local = torch.minimum(local.clamp(min=0), limit)
+        return self.starts[self.motion_ids].unsqueeze(1) + local
+
+    def _pack_fb_frames(self) -> None:
+        """Every clip frame in the ``fb_state`` layout, once.
+
+        The observation stores indices into this table. Replay does not copy
+        the frames.
+        """
+        motion_index = self.fb_joint_motion_index
+        present = motion_index >= 0
+        joint_pos = self.joint_pos.new_zeros(self.joint_pos.shape[0], motion_index.numel())
+        joint_vel = self.joint_vel.new_zeros(self.joint_vel.shape[0], motion_index.numel())
+        joint_pos[:, present] = self.joint_pos[:, motion_index[present]]
+        joint_vel[:, present] = self.joint_vel[:, motion_index[present]]
+        gravity_w = self.root_quat.new_tensor((0.0, 0.0, -1.0)).expand(self.root_quat.shape[0], 3)
+        gravity = quat_rotate_inverse(self.root_quat, gravity_w)
+        ang_vel_b = quat_rotate_inverse(self.root_quat, self.root_ang_vel)
+        lin_vel_b = quat_rotate_inverse(self.root_quat, self.root_lin_vel)
+        self.fb_frames = torch.cat((joint_pos, joint_vel, gravity, ang_vel_b, lin_vel_b), dim=-1)
+
+    @property
+    def ref_fb_state(self) -> torch.Tensor:
+        return self.fb_frames[self.ref_fb_index]
+
     def _gather(self, field: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         local = self.t.unsqueeze(1) + offsets
         limit = (self.lengths[self.motion_ids] - 1).unsqueeze(1).clamp(min=0)
@@ -304,26 +333,7 @@ class BFMCommand(Command):
         self.ref_root_quat = self._gather(self.root_quat, self._lookahead)
         ref_lin_vel = self._gather(self.root_lin_vel, self._lookahead)
         ref_ang_vel = self._gather(self.root_ang_vel, self._lookahead)
-        ref_joint = self._gather(self.joint_pos, self._lookahead)
-        ref_joint_vel = self._gather(self.joint_vel, self._lookahead)
-        motion_index = self.fb_joint_motion_index
-        joint_sim = ref_joint.new_zeros(
-            self.num_envs, self.num_lookahead, motion_index.numel()
-        )
-        joint_vel_sim = ref_joint_vel.new_zeros(
-            self.num_envs, self.num_lookahead, motion_index.numel()
-        )
-        present = motion_index >= 0
-        joint_sim[..., present] = ref_joint[..., motion_index[present]]
-        joint_vel_sim[..., present] = ref_joint_vel[..., motion_index[present]]
-        gravity = quat_rotate_inverse(
-            self.ref_root_quat, self._gravity.expand_as(self.ref_root_quat[..., :3])
-        )
-        ang_vel_b = quat_rotate_inverse(self.ref_root_quat, ref_ang_vel)
-        lin_vel_b = quat_rotate_inverse(self.ref_root_quat, ref_lin_vel)
-        self.ref_fb_state = torch.cat(
-            (joint_sim, joint_vel_sim, gravity, ang_vel_b, lin_vel_b), dim=-1
-        )
+        self.ref_fb_index = self._lookahead_index()
         current_quat = self.asset.data.root_link_quat_w
         anchor_quat = current_quat.unsqueeze(1)
         relative = quat_mul(quat_conjugate(anchor_quat), self.ref_root_quat)

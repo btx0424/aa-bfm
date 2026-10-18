@@ -70,8 +70,7 @@ observation:
     projected_gravity_b: {}
     root_angvel_b: {}
     root_linvel_b: {}
-  # Reference lookahead in the fb_state layout. The FB update re-encodes this
-  # with the current B. It is not an actor input.
+  # Indices into BFMCommand.fb_frames. Not an actor input.
   fb_prompt:
     fb_prompt: {}
 

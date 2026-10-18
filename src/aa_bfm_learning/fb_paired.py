@@ -253,7 +253,7 @@ class FBPairedConfig:
     actor_std: float = 0.5
     stddev_clip: float = 2.5
     q_loss_coef: float = 1.0
-    max_grad_norm: float = 5.0
+    max_grad_norm: float = 10000.0
     # Fraction of update rows whose prompt is B(next fb_state), not the reference.
     achieved_z_prob: float = 0.2
 
@@ -293,10 +293,16 @@ class FBPaired(TensorDictModuleBase):
         fake = observation_spec.zero()
         self.obs_dim = int(fake[OBS_KEY].shape[-1])
         self.b_dim = int(fake[FB_KEY].shape[-1])
-        prompt_dim = int(fake[PROMPT_KEY].shape[-1])
-        if prompt_dim % self.b_dim != 0:
-            raise ValueError(f"fb_prompt dim {prompt_dim} is not a multiple of fb_state dim {self.b_dim}")
-        self.prompt_horizon = prompt_dim // self.b_dim
+        self.prompt_horizon = int(fake[PROMPT_KEY].shape[-1])
+        if self.prompt_horizon != int(command_manager.num_lookahead):
+            raise ValueError(
+                f"fb_prompt has {self.prompt_horizon} indices, "
+                f"lookahead is {command_manager.num_lookahead}"
+            )
+        if int(command_manager.fb_frames.shape[-1]) != self.b_dim:
+            raise ValueError(
+                f"fb_frames width {command_manager.fb_frames.shape[-1]} != fb_state {self.b_dim}"
+            )
         self.act_dim = int(action_spec.shape[-1])
         self.z_dim = int(cfg.z_dim)
         if cfg.num_parallel < 1:
@@ -539,7 +545,8 @@ class FBPaired(TensorDictModuleBase):
         }
 
     def _prompt_frames(self, prompt: torch.Tensor) -> torch.Tensor:
-        return prompt.reshape(*prompt.shape[:-1], self.prompt_horizon, self.b_dim)
+        """``(..., H)`` indices into ``command_manager.fb_frames`` → ``(..., H, b_dim)``."""
+        return self.command_manager.fb_frames[prompt.long()]
 
     def _encode_prompt(self, prompt: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():

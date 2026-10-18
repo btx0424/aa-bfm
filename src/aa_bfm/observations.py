@@ -84,12 +84,9 @@ def _tan_norm(quat: torch.Tensor) -> torch.Tensor:
 
 
 class fb_prompt(Observation):
-    """Reference lookahead in the ``fb_state`` layout, frames concatenated.
+    """Indices into ``BFMCommand.fb_frames`` for the lookahead window.
 
-    ``BFMCommand.ref_fb_state`` is ``(N, H, b_dim)`` for the configured
-    lookahead offsets. Flattening it into this group puts that window in the
-    replay buffer, so an update can run the current ``B`` over it instead of
-    trusting the ``z`` stored at rollout.
+    The frames themselves stay on the command. Replay stores ``H`` integers.
     """
 
     @override
@@ -99,30 +96,23 @@ class fb_prompt(Observation):
         if not isinstance(command, BFMCommand):
             raise TypeError("fb_prompt requires BFMCommand")
         self.command = command
-        self.asset = command.asset
-        self.joint_names = list(command.fb_joint_names)
         self.horizon = int(command.num_lookahead)
-        frame_dim = int(command.ref_fb_state.shape[-1])
-        # Position, velocity, gravity, angular velocity, linear velocity.
-        expected = 2 * len(self.joint_names) + 9
+        frame_dim = int(command.fb_frames.shape[-1])
+        expected = 2 * len(command.fb_joint_names) + 9
         if frame_dim != expected:
             raise ValueError(
-                f"ref_fb_state frame is {frame_dim}, expected {expected} "
-                f"({len(self.joint_names)} simulation-order joints, twice, plus 9)"
+                f"fb_frames width is {frame_dim}, expected {expected} "
+                f"({len(command.fb_joint_names)} simulation-order joints, twice, plus 9)"
             )
 
     @override
     def compute(self) -> torch.Tensor:
-        return self.command.ref_fb_state.reshape(self.num_envs, -1)
+        return self.command.ref_fb_index
 
     @override
     def symmetry_transform(self) -> SymmetryTransform:
-        """Mirror each lookahead frame in ``fb_state`` order."""
-        joints = joint_space_symmetry(self.asset, self.joint_names)
-        lateral = SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([1.0, -1.0, 1.0]))
-        angular = SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([-1.0, 1.0, -1.0]))
-        frame = SymmetryTransform.cat([joints, joints, lateral, angular, lateral])
-        return frame.repeat(self.horizon)
+        """Indices are not a spatial feature. Leave the lookahead slots in place."""
+        return SymmetryTransform(perm=torch.arange(self.horizon), signs=torch.ones(self.horizon))
 
 
 class smp_state(Observation):
