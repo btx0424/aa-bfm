@@ -43,7 +43,7 @@ input:
 
 command:
   _target_: BFMCommand
-  lookahead: [1,2,3,4,5,6,7,8]
+  lookahead: [1,2,3,4]
   reward_std: 0.5
   fall_xy_thres: 0.8
   ground_height: 0.4
@@ -62,13 +62,14 @@ observation:
   # One kinematic frame. Slice this group over time to build the SMP window.
   smp_:
     smp_state: {}
-  # B reads this group as one vector: joint position, gravity, root angular velocity.
-  # Joint order is the simulation order of joint_pos. Reference frames are packed
-  # the same way in BFMCommand.ref_fb_state.
+  # B reads this group as one vector. Joint position and velocity are in
+  # simulation order. BFMCommand.ref_fb_state uses this same layout.
   fb_state:
     joint_pos: {joint_names: ".*"}
+    joint_vel: {joint_names: ".*"}
     projected_gravity_b: {}
     root_angvel_b: {}
+    root_linvel_b: {}
   # Reference lookahead in the fb_state layout. The FB update re-encodes this
   # with the current B. It is not an actor input.
   fb_prompt:

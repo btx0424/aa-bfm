@@ -1,9 +1,10 @@
 """Fully paired forward-backward training.
 
-``z`` is re-encoded from the ``fb_prompt`` observation with the current ``B``
-on every update, for ``F`` and for the actor. The rollout encodes the same
-window only to choose the action; it does not store ``z``. There is no
-discriminator, auxiliary critic, or task relabeling.
+On each update, ``z`` is the current ``B`` of ``fb_prompt``, except with
+probability ``achieved_z_prob`` it is ``B`` of that transition's own next
+``fb_state``. There is no shuffle across the batch. The rollout still encodes
+the reference window to choose the action and does not store ``z``. There is
+no discriminator or auxiliary critic.
 
 The forward-backward residual is the UFO loss: squared off-diagonal successor
 measure, linear diagonal, and orthonormality on ``B``.
@@ -136,21 +137,58 @@ class BackwardMap(nn.Module):
         return project_z(self.net(state))
 
 
+class _ResidualBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.Mish(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(x)
+
+
+class _ForwardMember(nn.Module):
+    """Separate ``(s, z)`` and ``(s, a)`` embeddings, then two residual blocks.
+
+    Width stays at ``hidden_dim`` (512). UFO uses 2048 and six blocks on each path.
+    """
+
+    def __init__(self, state_dim: int, action_dim: int, z_dim: int, hidden_dim: int):
+        super().__init__()
+        half = hidden_dim // 2
+        self.embed_z = nn.Sequential(
+            nn.Linear(state_dim + z_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, half),
+            nn.Mish(),
+        )
+        self.embed_sa = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, half),
+            nn.Mish(),
+        )
+        self.trunk = nn.Sequential(
+            _ResidualBlock(hidden_dim),
+            _ResidualBlock(hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, z_dim),
+        )
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        z_embedding = self.embed_z(torch.cat([state, z], dim=-1))
+        sa_embedding = self.embed_sa(torch.cat([state, action], dim=-1))
+        return self.trunk(torch.cat([sa_embedding, z_embedding], dim=-1))
+
+
 class ForwardMap(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, z_dim: int, hidden_dim: int, num_parallel: int):
         super().__init__()
         self.members = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(state_dim + action_dim + z_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.Mish(),
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.Mish(),
-                    nn.Linear(hidden_dim, z_dim),
-                )
-                for _ in range(num_parallel)
-            ]
+            [_ForwardMember(state_dim, action_dim, z_dim, hidden_dim) for _ in range(num_parallel)]
         )
         self.reset_parameters()
 
@@ -161,16 +199,18 @@ class ForwardMap(nn.Module):
         """
         hidden_gain = nn.init.calculate_gain("relu")
         for member in self.members:
-            linears = [module for module in member if isinstance(module, nn.Linear)]
-            for linear in linears[:-1]:
-                nn.init.orthogonal_(linear.weight, gain=hidden_gain)
-                nn.init.zeros_(linear.bias)
-            nn.init.zeros_(linears[-1].weight)
-            nn.init.zeros_(linears[-1].bias)
+            last = member.trunk[-1]
+            linears = [module for module in member.modules() if isinstance(module, nn.Linear)]
+            for linear in linears:
+                if linear is last:
+                    nn.init.zeros_(linear.weight)
+                    nn.init.zeros_(linear.bias)
+                else:
+                    nn.init.orthogonal_(linear.weight, gain=hidden_gain)
+                    nn.init.zeros_(linear.bias)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        inputs = torch.cat([state, action, z], dim=-1)
-        return torch.stack([member(inputs) for member in self.members], dim=0)
+        return torch.stack([member(state, action, z) for member in self.members], dim=0)
 
 
 class FBActor(nn.Module):
@@ -210,10 +250,12 @@ class FBPairedConfig:
     ortho_coef: float = 100.0
     fb_pessimism: float = 0.0
     actor_pessimism: float = 0.5
-    actor_std: float = 0.05
-    stddev_clip: float = 0.3
+    actor_std: float = 0.5
+    stddev_clip: float = 2.5
     q_loss_coef: float = 1.0
     max_grad_norm: float = 5.0
+    # Fraction of update rows whose prompt is B(next fb_state), not the reference.
+    achieved_z_prob: float = 0.2
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY, PROMPT_KEY)
 
@@ -342,8 +384,9 @@ class FBPaired(TensorDictModuleBase):
             ).to(self.device)
             if batch.batch_dims >= 2 and batch.batch_size[0] == 1:
                 batch = batch[0]
-            last = self._update_fb(batch)
-            last.update(self._update_actor(batch))
+            z = self._mixed_z(batch)
+            last = self._update_fb(batch, z)
+            last.update(self._update_actor(batch, z))
             if i == updates - 1:
                 infos.update(last)
         soft_copy_(unwrap_ddp(self.F), self.F_target, tau=self.cfg.tau)
@@ -376,15 +419,29 @@ class FBPaired(TensorDictModuleBase):
         action = (loc + noise).clamp(-1.0 + 1.0e-6, 1.0 - 1.0e-6)
         return 5.0 * action
 
-    def _update_fb(self, batch: TensorDict) -> dict[str, float]:
+    def _mixed_z(self, batch: TensorDict) -> torch.Tensor:
+        """Reference prompt, replaced on some rows by ``B`` of the achieved next state.
+
+        The replacement uses this transition's own ``fb_state``, not a shuffled
+        row. ``B`` is detached so the loss cannot edit ``z``.
+        """
+        prompt = self._encode_prompt(batch[PROMPT_KEY])
+        prob = float(self.cfg.achieved_z_prob)
+        if prob <= 0.0:
+            return prompt
+        with torch.no_grad():
+            achieved = unwrap_ddp(self.B)(self._normalize_b(batch["next", FB_KEY]))
+        mask = torch.rand(prompt.shape[0], 1, device=prompt.device) < prob
+        return torch.where(mask, achieved, prompt)
+
+    def _update_fb(self, batch: TensorDict, z: torch.Tensor | None = None) -> dict[str, float]:
         obs = self._normalize_obs(batch[OBS_KEY])
         next_obs = self._normalize_obs(batch["next", OBS_KEY])
         state = self._normalize_b(batch[FB_KEY])
         next_state = self._normalize_b(batch["next", FB_KEY])
         action = batch[ACTION_KEY]
-        # Current ``B`` on the stored reference window. Detach so the loss
-        # cannot move the prompt to shrink the residual.
-        z = self._encode_prompt(batch[PROMPT_KEY])
+        if z is None:
+            z = self._mixed_z(batch)
         discount = self._discount(batch)
         batch_size = state.shape[0]
         eye = torch.eye(batch_size, device=state.device)
@@ -461,9 +518,10 @@ class FBPaired(TensorDictModuleBase):
             grad_norm_b=grad_norm_B,
         )
 
-    def _update_actor(self, batch: TensorDict) -> dict[str, float]:
+    def _update_actor(self, batch: TensorDict, z: torch.Tensor | None = None) -> dict[str, float]:
         obs = self._normalize_obs(batch[OBS_KEY])
-        z = self._encode_prompt(batch[PROMPT_KEY])
+        if z is None:
+            z = self._mixed_z(batch)
         action = self._sample_action(obs, z, mean=False)
         features = self.F(obs, action, z)
         q = uncertainty_target((features * z).sum(-1), self.cfg.actor_pessimism)

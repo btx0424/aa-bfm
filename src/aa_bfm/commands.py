@@ -197,8 +197,9 @@ class BFMCommand(Command):
         self.cur_root_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.cur_root_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.sim_joint_dim = joint_count
+        # joint pos, joint vel, gravity, angular velocity, linear velocity.
         self.ref_fb_state = torch.zeros(
-            self.num_envs, self.num_lookahead, joint_count + 6, device=self.device
+            self.num_envs, self.num_lookahead, 2 * joint_count + 9, device=self.device
         )
         self._gravity = torch.tensor((0.0, 0.0, -1.0), device=self.device)
         self.cur_keypoint_pos = torch.zeros(self.num_envs, keypoint_count, 3, device=self.device)
@@ -304,18 +305,25 @@ class BFMCommand(Command):
         ref_lin_vel = self._gather(self.root_lin_vel, self._lookahead)
         ref_ang_vel = self._gather(self.root_ang_vel, self._lookahead)
         ref_joint = self._gather(self.joint_pos, self._lookahead)
+        ref_joint_vel = self._gather(self.joint_vel, self._lookahead)
         motion_index = self.fb_joint_motion_index
         joint_sim = ref_joint.new_zeros(
             self.num_envs, self.num_lookahead, motion_index.numel()
         )
+        joint_vel_sim = ref_joint_vel.new_zeros(
+            self.num_envs, self.num_lookahead, motion_index.numel()
+        )
         present = motion_index >= 0
         joint_sim[..., present] = ref_joint[..., motion_index[present]]
+        joint_vel_sim[..., present] = ref_joint_vel[..., motion_index[present]]
         gravity = quat_rotate_inverse(
             self.ref_root_quat, self._gravity.expand_as(self.ref_root_quat[..., :3])
         )
-        ang_vel_w = self._gather(self.root_ang_vel, self._lookahead)
-        ang_vel_b = quat_rotate_inverse(self.ref_root_quat, ang_vel_w)
-        self.ref_fb_state = torch.cat((joint_sim, gravity, ang_vel_b), dim=-1)
+        ang_vel_b = quat_rotate_inverse(self.ref_root_quat, ref_ang_vel)
+        lin_vel_b = quat_rotate_inverse(self.ref_root_quat, ref_lin_vel)
+        self.ref_fb_state = torch.cat(
+            (joint_sim, joint_vel_sim, gravity, ang_vel_b, lin_vel_b), dim=-1
+        )
         current_quat = self.asset.data.root_link_quat_w
         anchor_quat = current_quat.unsqueeze(1)
         relative = quat_mul(quat_conjugate(anchor_quat), self.ref_root_quat)

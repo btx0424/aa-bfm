@@ -103,10 +103,12 @@ class fb_prompt(Observation):
         self.joint_names = list(command.fb_joint_names)
         self.horizon = int(command.num_lookahead)
         frame_dim = int(command.ref_fb_state.shape[-1])
-        if frame_dim != len(self.joint_names) + 6:
+        # Position, velocity, gravity, angular velocity, linear velocity.
+        expected = 2 * len(self.joint_names) + 9
+        if frame_dim != expected:
             raise ValueError(
-                f"ref_fb_state frame is {frame_dim}, expected "
-                f"{len(self.joint_names)} simulation-order joints + gravity + angular velocity"
+                f"ref_fb_state frame is {frame_dim}, expected {expected} "
+                f"({len(self.joint_names)} simulation-order joints, twice, plus 9)"
             )
 
     @override
@@ -115,14 +117,11 @@ class fb_prompt(Observation):
 
     @override
     def symmetry_transform(self) -> SymmetryTransform:
-        """Mirror each lookahead frame: joints, then gravity, then angular velocity."""
-        frame = SymmetryTransform.cat(
-            [
-                joint_space_symmetry(self.asset, self.joint_names),
-                SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([1.0, -1.0, 1.0])),
-                SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([-1.0, 1.0, -1.0])),
-            ]
-        )
+        """Mirror each lookahead frame in ``fb_state`` order."""
+        joints = joint_space_symmetry(self.asset, self.joint_names)
+        lateral = SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([1.0, -1.0, 1.0]))
+        angular = SymmetryTransform(perm=torch.arange(3), signs=torch.tensor([-1.0, 1.0, -1.0]))
+        frame = SymmetryTransform.cat([joints, joints, lateral, angular, lateral])
         return frame.repeat(self.horizon)
 
 
