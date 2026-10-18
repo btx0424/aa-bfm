@@ -129,13 +129,13 @@ class FBPairedConfig:
     lr_b: float = 1.0e-5
     lr_actor: float = 3.0e-4
     tau: float = 0.01
-    ortho_coef: float = 1.0
+    ortho_coef: float = 100.0
     fb_pessimism: float = 0.0
     actor_pessimism: float = 0.5
     actor_std: float = 0.05
     stddev_clip: float = 0.3
-    q_loss_coef: float = 0.0
-    max_grad_norm: float = 0.0
+    q_loss_coef: float = 1.0
+    max_grad_norm: float = 5.0
 
     in_keys: Tuple[str, ...] = (OBS_KEY, FB_KEY)
 
@@ -320,6 +320,23 @@ class FBPaired(TensorDictModuleBase):
         pred_b = self.B(next_state)
         pred_m = torch.matmul(pred_f, pred_b.transpose(-1, -2))
         # Scale each transition's successor row. ``discount`` is (batch, 1).
+        #
+        # Scales for z_dim=256, batch=512, 2 heads, gamma=0.98. ``project_z``
+        # fixes ``||B|| = ||z|| = 16``, so these losses are not comparable.
+        #   orth_diag = -||B||^2 = -256, exactly, every step.
+        #   orth_off = 0.5 * mean_{i≠j} (B_i·B_j)^2. Random embeddings give
+        #   ~128 (RMS cosine ~0.5; thousands means they are still aligned).
+        #   The isotropic floor is ~64 and it cannot fall to 0: 512 vectors in
+        #   256-d must have residual dots. ~200 is RMS cosine ~0.08.
+        #   offdiag = 0.5 * mean_{i≠j} (M_ij - γ M'_ij)^2. It ignores the
+        #   diagonal. RMS residual 1 → ~0.5; RMS residual 10 → 50. A fit is
+        #   single digits to low tens. Small offdiag does not mean Q is right.
+        #   diag = -mean_i(M_ii - γ M'_ii) * num_heads. A one-step residual of
+        #   +1, the successor-measure "reward", gives diag ≈ +2. Hundreds means
+        #   the self-entry misses the bootstrap by hundreds. Large negative
+        #   means M_ii is above its bootstrap.
+        #   m_diag = mean F·B. A successor self-entry is O(1/(1-γ)) = O(50)
+        #   when the implicit reward is O(1). Thousands means F has left that scale.
         diff = pred_m - discount.view(1, -1, 1) * target_m.unsqueeze(0)
         fb_offdiag = 0.5 * (diff * off_diag).square().sum() / off_diag_sum
         fb_diag = -torch.diagonal(diff, dim1=-2, dim2=-1).mean() * diff.shape[0]
@@ -330,23 +347,31 @@ class FBPaired(TensorDictModuleBase):
         loss = fb_offdiag + fb_diag + self.cfg.ortho_coef * orth
 
         q_loss = obs.new_zeros(())
-        if self.cfg.q_loss_coef > 0.0:
-            with torch.no_grad():
-                next_q = uncertainty_target((target_f * z).sum(-1), self.cfg.fb_pessimism)
-                feature_cov = torch.matmul(pred_b.transpose(-1, -2), pred_b) / batch_size
-                solved = torch.linalg.solve(feature_cov.float(), pred_b.float(), left=False)
-                reward = (solved * z.float()).sum(-1)
-                q_target = reward + discount.squeeze(-1) * next_q
-            q_pred = (pred_f * z).sum(-1)
-            q_loss = 0.5 * pred_f.shape[0] * F.mse_loss(q_pred, q_target.unsqueeze(0).expand_as(q_pred))
-            loss = loss + self.cfg.q_loss_coef * q_loss
+        with torch.no_grad():
+            next_q = uncertainty_target((target_f * z).sum(-1), self.cfg.fb_pessimism)
+            feature_cov = torch.matmul(pred_b.transpose(-1, -2), pred_b) / batch_size
+            solved = torch.linalg.solve(feature_cov.float(), pred_b.float(), left=False)
+            reward = (solved * z.float()).sum(-1)
+            q_target = reward + discount.squeeze(-1) * next_q
+        q_pred = (pred_f * z).sum(-1)
+        # q_loss = 0.5 * num_heads * MSE = MSE at num_heads=2, so the log is
+        # the squared Bellman residual and RMSE is sqrt(q_loss).
+        # With Σ_B ≈ I, the one-step reward is B·z ∈ [-256, 256] (256 is a
+        # perfect feature match, ~16 is a random dot). A true return is then
+        # at most 256/(1-γ) = 12800, and a modest match (reward ~80) sits
+        # near 4000. q_value in the thousands is inside that range only while
+        # q_loss is small. A fit has RMSE of a few to a few tens, so q_loss
+        # of ~10–1000. 5e4 is RMSE ~224, a whole reward; 6e5 is RMSE ~775,
+        # larger than any legal one-step reward. coef 0 leaves it there.
+        # fb/loss does not contain this term unless q_loss_coef > 0.
+        q_loss = 0.5 * pred_f.shape[0] * F.mse_loss(q_pred, q_target.unsqueeze(0).expand_as(q_pred))
+        loss = loss + self.cfg.q_loss_coef * q_loss
 
         self.opt_F.zero_grad(set_to_none=True)
         self.opt_B.zero_grad(set_to_none=True)
         loss.backward()
-        if self.cfg.max_grad_norm > 0.0:
-            nn.utils.clip_grad_norm_(self.F.parameters(), self.cfg.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.B.parameters(), self.cfg.max_grad_norm)
+        grad_norm_F = nn.utils.clip_grad_norm_(self.F.parameters(), self.cfg.max_grad_norm)
+        grad_norm_B = nn.utils.clip_grad_norm_(self.B.parameters(), self.cfg.max_grad_norm)
         self.opt_F.step()
         self.opt_B.step()
         with torch.no_grad():
@@ -366,9 +391,10 @@ class FBPaired(TensorDictModuleBase):
             "fb/q_disagreement": float(q_disagreement),
             "fb/m_diag": float(m_diag),
             "fb/discount": float(discount.mean()),
+            "fb/grad_norm_F": float(grad_norm_F),
+            "fb/grad_norm_B": float(grad_norm_B),
         }
-        if self.cfg.q_loss_coef > 0.0:
-            metrics["fb/q_loss"] = float(q_loss.detach())
+        metrics["fb/q_loss"] = float(q_loss.detach())
         return metrics
 
     def _update_actor(self, batch: TensorDict) -> dict[str, float]:
@@ -376,14 +402,20 @@ class FBPaired(TensorDictModuleBase):
         z = batch["z"]
         action = self._sample_action(obs, z, mean=False)
         features = self.F(obs, action, z)
+        # actor/q is F(s, a_π, z)^T z after pessimism, same units as fb/q_value
+        # (hundreds to a few thousand; ceiling ~12800 for a perfect B·z every
+        # step). actor/loss = -actor/q, so a large negative loss is a large Q.
         q = uncertainty_target((features * z).sum(-1), self.cfg.actor_pessimism)
         loss = -q.mean()
         self.opt_actor.zero_grad(set_to_none=True)
         loss.backward()
-        if self.cfg.max_grad_norm > 0.0:
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
+        grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.opt_actor.step()
-        return {"actor/loss": float(loss.detach()), "actor/q": float(q.mean().detach())}
+        return {
+            "actor/loss": float(loss.detach()),
+            "actor/q": float(q.mean().detach()),
+            "actor/grad_norm": float(grad_norm),
+        }
 
     def encode_reference(self, ref_state: torch.Tensor) -> torch.Tensor:
         """``z = Π(mean_h B(s_ref))`` over ``BFMCommand.ref_fb_state``."""
