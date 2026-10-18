@@ -1,10 +1,12 @@
 """Paired forward-backward with a task-reward critic driving the actor.
 
-``F`` and ``B`` still train with the paired FB loss. The behavior policy does
-not ascend ``F^T z``. It ascends a twin critic of the ``track`` reward group,
-conditioned on the policy observation and the ``command`` reference. The
-command is the lookahead the reward was computed from; ``z`` does not contain
-root position or keypoints, so the critic has to see ``command`` itself.
+``F`` and ``B`` still train with the one-step paired FB loss. The behavior
+policy does not ascend ``F^T z``. It ascends a twin critic of the sum of
+every enabled reward group, conditioned on the policy observation and the
+``command`` reference. The command is the lookahead the tracking reward was
+computed from; ``z`` does not contain root position or keypoints, so the
+critic has to see ``command`` itself. The critic target is an n-step return
+of that sum, bootstrapped at the command of the state ``n`` steps ahead.
 """
 
 from __future__ import annotations
@@ -22,7 +24,15 @@ from torchrl.objectives import hold_out_net
 
 import active_adaptation as aa
 from active_adaptation.learning.modules import VecNorm
-from active_adaptation.learning.ppo.common import ACTION_KEY, CMD_KEY, OBS_KEY, soft_copy_
+from active_adaptation.learning.offpolicy.objectives import MultiStepReturn
+from active_adaptation.learning.ppo.common import (
+    ACTION_KEY,
+    CMD_KEY,
+    DONE_KEY,
+    OBS_KEY,
+    TERM_KEY,
+    soft_copy_,
+)
 from active_adaptation.learning.utils.distributed import unwrap_ddp, wrap_ddp
 
 from .fb_paired import FBPaired, FBPairedConfig, FBRolloutPolicy, uncertainty_target
@@ -74,8 +84,13 @@ class FBDebugConfig(FBPairedConfig):
     _target_: str = "aa_bfm_learning.fb_debug.FBDebugConfig"
     name: str = "fb_debug"
     lr_q: float = 3.0e-4
-    task_reward_group: str = "track"
+    # Critic only. ``F`` and ``B`` stay one-step. ``1`` is the previous backup.
+    n_steps: int = 3
     task_pessimism: float = 0.5
+
+    def __post_init__(self):
+        if self.n_steps < 1:
+            raise ValueError(f"n_steps must be >= 1, got {self.n_steps}.")
 
     def get_class(self):
         return FBDebug
@@ -105,11 +120,10 @@ class FBDebug(FBPaired):
         )
         if CMD_KEY not in observation_spec.keys(True, True):
             raise KeyError(f"fb_debug requires an observation group {CMD_KEY!r}.")
-        reward_groups = list(reward_spec["reward"].keys())
-        if cfg.task_reward_group not in reward_groups:
-            raise KeyError(
-                f"task reward group {cfg.task_reward_group!r} is not in the env rewards {reward_groups}."
-            )
+        # Disabled groups are omitted from the spec, so these are the enabled ones.
+        self.reward_group_keys = list(reward_spec["reward"].keys())
+        if not self.reward_group_keys:
+            raise KeyError("fb_debug requires at least one enabled reward group.")
         fake = observation_spec.zero()
         self.cmd_dim = int(fake[CMD_KEY].shape[-1])
         self.vecnorm_cmd = VecNorm(self.cmd_dim).to(device)
@@ -122,6 +136,9 @@ class FBDebug(FBPaired):
         self.Q_target = copy.deepcopy(self.Q).requires_grad_(False).eval()
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr_actor)
         self.opt_Q = torch.optim.Adam(self.Q.parameters(), lr=cfg.lr_q)
+        self.msr = (
+            MultiStepReturn(cfg.gamma, cfg.n_steps).to(device) if cfg.n_steps > 1 else None
+        )
         self._action_command: torch.Tensor | None = None
 
         if self._distributed:
@@ -150,16 +167,17 @@ class FBDebug(FBPaired):
         updates = self.cfg.train_every * self.cfg.utd_ratio
         last: dict[str, float] = {}
         for i in range(updates):
-            batch = self.rb.sample(
+            window = self.rb.sample(
                 batch_size=self.cfg.fb_batch_size,
-                steps=1,
+                steps=self.cfg.n_steps,
                 next_obs=True,
             ).to(self.device)
-            if batch.batch_dims >= 2 and batch.batch_size[0] == 1:
-                batch = batch[0]
-            last = self._update_fb(batch)
-            last.update(self._update_q(batch))
-            last.update(self._update_actor(batch))
+            # ``fake_bootstrap`` always returns a time axis. ``F``, ``B``, and
+            # the actor stay on the first transition of the window.
+            step = window[0] if window.batch_dims >= 2 else window
+            last = self._update_fb(step)
+            last.update(self._update_q(window if self.cfg.n_steps > 1 else step))
+            last.update(self._update_actor(step))
             if i == updates - 1:
                 infos.update(last)
         soft_copy_(unwrap_ddp(self.F), self.F_target, tau=self.cfg.tau)
@@ -172,8 +190,11 @@ class FBDebug(FBPaired):
         return self.vecnorm_cmd(command)
 
     def _task_reward(self, batch: TensorDict) -> torch.Tensor:
-        reward = batch["next", "reward", self.cfg.task_reward_group]
-        return reward.sum(dim=-1)
+        reward = batch["next", "reward"]
+        total = reward[self.reward_group_keys[0]].sum(dim=-1)
+        for key in self.reward_group_keys[1:]:
+            total = total + reward[key].sum(dim=-1)
+        return total
 
     def _sample_action(self, state: torch.Tensor, z: torch.Tensor, mean: bool) -> torch.Tensor:
         del z
@@ -193,25 +214,71 @@ class FBDebug(FBPaired):
         self._action_command = self._normalize_cmd(batch["next", CMD_KEY]).detach()
         return super()._update_fb(batch)
 
-    def _update_q(self, batch: TensorDict) -> dict[str, float]:
-        obs = self._normalize_obs(batch[OBS_KEY])
+    def _q_backup(self, batch: TensorDict) -> tuple[torch.Tensor, ...]:
+        """``(s, command, a)`` at ``t``, and the bootstrap at ``t+n``.
+
+        ``n == 1`` is ``r_t + γ_t Q(s_{t+1}, command_{t+1}, a')``. Longer
+        windows use :class:`MultiStepReturn`: the reward is the discounted
+        sum along the window, and the bootstrap state is the last step that
+        is still in the episode. The command is carried along with that
+        state, because the critic is conditioned on the lookahead.
+        """
+        if self.cfg.n_steps == 1:
+            obs = self._normalize_obs(batch[OBS_KEY])
+            command = self._normalize_cmd(batch[CMD_KEY])
+            action = batch[ACTION_KEY]
+            next_obs = self._normalize_obs(batch["next", OBS_KEY])
+            next_command = self._normalize_cmd(batch["next", CMD_KEY])
+            reward = self._task_reward(batch)
+            discount = self._discount(batch).squeeze(-1)
+            return obs, command, action, next_obs, next_command, reward, discount, reward
+
+        assert self.msr is not None
+        obs = self._normalize_obs(batch[OBS_KEY][0])
+        command = self._normalize_cmd(batch[CMD_KEY][0])
+        action = batch[ACTION_KEY][0]
         next_obs = self._normalize_obs(batch["next", OBS_KEY])
-        command = self._normalize_cmd(batch[CMD_KEY])
         next_command = self._normalize_cmd(batch["next", CMD_KEY])
-        action = batch[ACTION_KEY]
-        reward = self._task_reward(batch)
-        discount = self._discount(batch).squeeze(-1)
+        # Index the bootstrap command with the same alive-step as ``next_obs``.
+        next_feat = torch.cat([next_obs, next_command], dim=-1)
+        reward = self._task_reward(batch).unsqueeze(-1)
+        _, next_feat, ret, discount, _terminated = self.msr(
+            actions=batch[ACTION_KEY],
+            next_observations=next_feat,
+            rewards=reward,
+            terminated=batch[TERM_KEY],
+            done=batch[DONE_KEY],
+            env_discount=batch["next", "discount"],
+        )
+        next_obs, next_command = next_feat.split([self.obs_dim, self.cmd_dim], dim=-1)
+        return (
+            obs,
+            command,
+            action,
+            next_obs,
+            next_command,
+            ret.squeeze(-1),
+            discount.squeeze(-1),
+            reward[0].squeeze(-1),
+        )
+
+    def _update_q(self, batch: TensorDict) -> dict[str, float]:
+        obs, command, action, next_obs, next_command, reward, discount, immediate = self._q_backup(
+            batch
+        )
         with torch.no_grad():
             self._action_command = next_command.detach()
-            next_action = self._sample_action(next_obs, batch["z"], mean=False)
+            # The task actor ignores ``z`` and reads ``_action_command``.
+            next_action = self._sample_action(next_obs, command, mean=False)
             next_q = uncertainty_target(
                 unwrap_ddp(self.Q_target)(next_obs, next_command, next_action),
                 self.cfg.task_pessimism,
             )
             target = reward + discount * next_q
         q = self.Q(obs, command, action)
-        # ``track`` is a sum of O(1) exponential terms. A true return is
-        # O(reward / (1 - γ)). The logged loss is the raw MSE, RMSE = sqrt(loss).
+        # The target is the sum of the enabled groups. ``track`` is O(1) per
+        # term; ``reg`` is a small penalty. A true return is O(reward / (1 - γ)).
+        # The logged loss is the raw MSE, RMSE = sqrt(loss).
         loss = F.mse_loss(q.float(), target.float().unsqueeze(0).expand_as(q))
         self.opt_Q.zero_grad(set_to_none=True)
         loss.backward()
@@ -220,7 +287,8 @@ class FBDebug(FBPaired):
         return {
             "task/q_loss": float(loss.detach()),
             "task/q_value": float(q.mean().detach()),
-            "task/reward": float(reward.mean().detach()),
+            "task/reward": float(immediate.mean().detach()),
+            "task/return": float(reward.mean().detach()),
             "task/grad_norm": float(grad_norm),
         }
 

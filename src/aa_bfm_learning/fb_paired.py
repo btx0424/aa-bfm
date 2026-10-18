@@ -27,7 +27,7 @@ from torchrl.envs.utils import ExplorationType, exploration_type
 import active_adaptation as aa
 from active_adaptation.learning.modules import VecNorm
 from active_adaptation.learning.offpolicy.buffer import ReplayBuffer
-from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY, soft_copy_
+from active_adaptation.learning.ppo.common import ACTION_KEY, CMD_KEY, OBS_KEY, soft_copy_
 from active_adaptation.learning.utils.distributed import unwrap_ddp, wrap_ddp
 
 if TYPE_CHECKING:
@@ -137,7 +137,7 @@ class FBPairedConfig:
     q_loss_coef: float = 1.0
     max_grad_norm: float = 5.0
 
-    in_keys: Tuple[str, ...] = (OBS_KEY, FB_KEY)
+    in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY)
 
     def get_class(self):
         return FBPaired

@@ -22,6 +22,7 @@ from active_adaptation.utils.math import (
     quat_mul,
     quat_rotate_inverse,
     rot6d,
+    yaw_quat,
 )
 from active_adaptation.utils.symmetry import SymmetryTransform, cartesian_space_symmetry
 
@@ -158,6 +159,11 @@ class BFMCommand(Command):
         self.ref_root_pos = torch.zeros(self.num_envs, self.num_lookahead, 3, device=self.device)
         self.ref_root_quat = torch.zeros(self.num_envs, self.num_lookahead, 4, device=self.device)
         self.ref_root_rot6d_b = torch.zeros(self.num_envs, self.num_lookahead, 6, device=self.device)
+        self.ref_root_pos_b = torch.zeros(self.num_envs, self.num_lookahead, 3, device=self.device)
+        self.ref_root_lin_vel_b = torch.zeros(self.num_envs, self.num_lookahead, 3, device=self.device)
+        self.ref_root_ang_vel_b = torch.zeros(self.num_envs, self.num_lookahead, 3, device=self.device)
+        self.cur_root_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.cur_root_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.sim_joint_dim = joint_count
         self.ref_fb_state = torch.zeros(
             self.num_envs, self.num_lookahead, joint_count + 6, device=self.device
@@ -245,10 +251,14 @@ class BFMCommand(Command):
         self.cur_keypoint_quat = self._gather(self.keypoint_quat, now).squeeze(1)
         self.cur_root_pos = self._gather(self.root_pos, now).squeeze(1)
         self.cur_root_quat = self._gather(self.root_quat, now).squeeze(1)
+        self.cur_root_lin_vel = self._gather(self.root_lin_vel, now).squeeze(1)
+        self.cur_root_ang_vel = self._gather(self.root_ang_vel, now).squeeze(1)
         self.ref_keypoint_pos = self._gather(self.keypoint_pos, self._lookahead)
         self.ref_keypoint_quat = self._gather(self.keypoint_quat, self._lookahead)
         self.ref_root_pos = self._gather(self.root_pos, self._lookahead)
         self.ref_root_quat = self._gather(self.root_quat, self._lookahead)
+        ref_lin_vel = self._gather(self.root_lin_vel, self._lookahead)
+        ref_ang_vel = self._gather(self.root_ang_vel, self._lookahead)
         ref_joint = self._gather(self.joint_pos, self._lookahead)
         joint_sim = ref_joint.new_zeros(self.num_envs, self.num_lookahead, self.sim_joint_dim)
         joint_sim[..., self.asset_joint_index] = ref_joint
@@ -259,12 +269,17 @@ class BFMCommand(Command):
         ang_vel_b = quat_rotate_inverse(self.ref_root_quat, ang_vel_w)
         self.ref_fb_state = torch.cat((joint_sim, gravity, ang_vel_b), dim=-1)
         current_quat = self.asset.data.root_link_quat_w
-        relative = quat_mul(quat_conjugate(current_quat.unsqueeze(1)), self.ref_root_quat)
+        anchor_quat = current_quat.unsqueeze(1)
+        relative = quat_mul(quat_conjugate(anchor_quat), self.ref_root_quat)
         self.ref_root_rot6d_b = rot6d(relative)
-        target_w = self.env.episode_origin[:, None, None, :] + self.ref_keypoint_pos
+        origin = self.env.episode_origin
+        root_delta = origin[:, None, :] + self.ref_root_pos - self.asset.data.root_link_pos_w[:, None, :]
+        self.ref_root_pos_b = quat_rotate_inverse(anchor_quat, root_delta)
+        self.ref_root_lin_vel_b = quat_rotate_inverse(anchor_quat, ref_lin_vel)
+        self.ref_root_ang_vel_b = quat_rotate_inverse(anchor_quat, ref_ang_vel)
+        target_w = origin[:, None, None, :] + self.ref_keypoint_pos
         anchor_pos = self.asset.data.root_link_pos_w[:, None, None, :]
-        anchor_quat = current_quat[:, None, None, :]
-        self.ref_keypoint_pos_b = quat_rotate_inverse(anchor_quat, target_w - anchor_pos)
+        self.ref_keypoint_pos_b = quat_rotate_inverse(anchor_quat[:, None, :], target_w - anchor_pos)
 
     def _termination_masks(self) -> tuple[torch.Tensor, torch.Tensor]:
         clip_ids = self.motion_ids
@@ -284,8 +299,14 @@ class BFMCommand(Command):
         self.t = torch.minimum(self.t + 1, self.lengths[self.motion_ids] - 1)
         self._load_lookahead()
 
-    @property
-    def command(self) -> torch.Tensor:
+    def command(self, key: str) -> torch.Tensor:
+        if key == "keypoint":
+            return self._keypoint_command()
+        if key == "root":
+            return self._root_command()
+        raise KeyError(f"Unknown BFM command {key!r}")
+
+    def _keypoint_command(self) -> torch.Tensor:
         return torch.cat(
             [
                 self.ref_keypoint_pos_b.reshape(self.num_envs, -1),
@@ -294,8 +315,34 @@ class BFMCommand(Command):
             dim=-1,
         )
 
-    def symmetry_transform(self) -> SymmetryTransform:
-        """Mirror future keypoint positions and the body-frame root orientation."""
+    def _root_command(self) -> torch.Tensor:
+        """Future root pose and twist in the current root frame.
+
+        The body is not tracked. Each lookahead step is position, rot6d
+        orientation, linear velocity, and angular velocity.
+        """
+        return torch.cat(
+            [
+                self.ref_root_pos_b.reshape(self.num_envs, -1),
+                self.ref_root_rot6d_b.reshape(self.num_envs, -1),
+                self.ref_root_lin_vel_b.reshape(self.num_envs, -1),
+                self.ref_root_ang_vel_b.reshape(self.num_envs, -1),
+            ],
+            dim=-1,
+        )
+
+    def symmetry_transform(self, key: str | None = None) -> SymmetryTransform:
+        """Mirror the command selected by ``key``."""
+        if key == "root":
+            step = SymmetryTransform.cat(
+                [
+                    SymmetryTransform.xyz(),
+                    SymmetryTransform.rot6d(),
+                    SymmetryTransform.xyz(),
+                    SymmetryTransform.rpy(),
+                ]
+            )
+            return step.repeat(self.num_lookahead)
         positions = cartesian_space_symmetry(self.asset, self.keypoint_names, sign=(1, -1, 1))
         return SymmetryTransform.cat(
             [positions.repeat(self.num_lookahead), SymmetryTransform.rot6d().repeat(self.num_lookahead)]
@@ -311,6 +358,9 @@ class BFMCommand(Command):
                 "ref_root_pos": self.ref_root_pos,
                 "ref_root_quat": self.ref_root_quat,
                 "ref_root_rot6d_b": self.ref_root_rot6d_b,
+                "ref_root_pos_b": self.ref_root_pos_b,
+                "ref_root_lin_vel_b": self.ref_root_lin_vel_b,
+                "ref_root_ang_vel_b": self.ref_root_ang_vel_b,
                 "motion_id": self.motion_ids,
                 "frame": self.t,
             },
@@ -327,13 +377,25 @@ class BFMCommand(Command):
             "ref_root_pos": (self.num_lookahead, 3),
             "ref_root_quat": (self.num_lookahead, 4),
             "ref_root_rot6d_b": (self.num_lookahead, 6),
+            "ref_root_pos_b": (self.num_lookahead, 3),
+            "ref_root_lin_vel_b": (self.num_lookahead, 3),
+            "ref_root_ang_vel_b": (self.num_lookahead, 3),
             "motion_id": (),
             "frame": (),
         }
 
     @override
     def from_state(self, command_state: TensorDictBase, key: str | None = None) -> torch.Tensor:
-        del key
+        if key == "root":
+            return torch.cat(
+                [
+                    command_state["ref_root_pos_b"].reshape(command_state.shape[0], -1),
+                    command_state["ref_root_rot6d_b"].reshape(command_state.shape[0], -1),
+                    command_state["ref_root_lin_vel_b"].reshape(command_state.shape[0], -1),
+                    command_state["ref_root_ang_vel_b"].reshape(command_state.shape[0], -1),
+                ],
+                dim=-1,
+            )
         positions = command_state["ref_keypoint_pos_b"].reshape(command_state.shape[0], -1)
         orientation = command_state["ref_root_rot6d_b"].reshape(command_state.shape[0], -1)
         return torch.cat([positions, orientation], dim=-1)
@@ -460,3 +522,44 @@ class tracking_root_ori_exp(Reward):
         delta = quat_mul(quat_conjugate(target), current)
         error = axis_angle_from_quat(delta).square().sum(dim=-1, keepdim=True)
         return torch.exp(-error / self.std**2)
+
+
+class tracking_root_vel_xy_exp(Reward):
+    """Exponential match of horizontal root linear velocity."""
+
+    def __init__(self, weight: float, std: float = 0.5):
+        super().__init__(weight)
+        self.std = float(std)
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        command = self.command_manager
+        if not isinstance(command, BFMCommand):
+            raise TypeError("tracking_root_vel_xy_exp requires BFMCommand")
+        current = command.asset.data.root_link_lin_vel_w[:, :2]
+        target = command.cur_root_lin_vel[:, :2]
+        error = (current - target).square().sum(dim=-1, keepdim=True)
+        return torch.exp(-error / self.std**2)
+
+
+class tracking_root_yaw_vel_exp(Reward):
+    """Exponential match of root yaw rate."""
+
+    def __init__(self, weight: float, std: float = 0.5):
+        super().__init__(weight)
+        self.std = float(std)
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        command = self.command_manager
+        if not isinstance(command, BFMCommand):
+            raise TypeError("tracking_root_yaw_vel_exp requires BFMCommand")
+        current = _yaw_rate(command.asset.data.root_link_quat_w, command.asset.data.root_link_ang_vel_w)
+        target = _yaw_rate(command.cur_root_quat, command.cur_root_ang_vel)
+        error = (current - target).square().unsqueeze(-1)
+        return torch.exp(-error / self.std**2)
+
+
+def _yaw_rate(quat: torch.Tensor, ang_vel_w: torch.Tensor) -> torch.Tensor:
+    """Yaw component of a world angular velocity, radians per second."""
+    return quat_rotate_inverse(yaw_quat(quat), ang_vel_w)[..., 2]
