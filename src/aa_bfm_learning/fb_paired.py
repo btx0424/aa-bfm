@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import autograd
+from .adversarial import make_discriminator
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase
@@ -242,38 +242,6 @@ class ForwardMap(nn.Module):
         return values
 
 
-class ZDiscriminator(nn.Module):
-    """Classify ``z`` alone: dataset embeddings versus embeddings of visited states."""
-
-    def __init__(self, z_dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        gain = nn.init.calculate_gain("relu")
-        linears = [module for module in self.net if isinstance(module, nn.Linear)]
-        for linear in linears[:-1]:
-            nn.init.orthogonal_(linear.weight, gain=gain)
-            nn.init.zeros_(linear.bias)
-        nn.init.orthogonal_(linears[-1].weight, gain=0.01)
-        nn.init.zeros_(linears[-1].bias)
-
-    def logits(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z).squeeze(-1)
-
-    def reward(self, z: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
-        """``log D(z) - log(1 - D(z))``. High when ``z`` looks like the dataset."""
-        probability = torch.sigmoid(self.logits(z)).clamp(eps, 1.0 - eps)
-        return probability.log() - (1.0 - probability).log()
-
-
 class FBActor(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, z_dim: int, hidden_dim: int):
         super().__init__()
@@ -327,6 +295,8 @@ class FBPairedConfig:
     scale_reg: bool = True
     grad_penalty: float = 10.0
     disc_hidden_dim: int = 256
+    # ``vanilla`` | ``lsgan`` | ``wgan``. The offset applies to the binary reward only.
+    disc: str = "lsgan"
     # Added to the Q_D reward. ``log D - log(1-D)`` reaches about -14 at the
     # probability clamp, so 14 keeps a fall from beating staying alive.
     disc_reward_offset: float = 14.0
@@ -395,7 +365,7 @@ class FBPaired(TensorDictModuleBase):
         self.B_target = copy.deepcopy(self.B).requires_grad_(False).eval()
         self.F_target = copy.deepcopy(self.F).requires_grad_(False).eval()
 
-        self.D = ZDiscriminator(self.z_dim, cfg.disc_hidden_dim).to(device)
+        self.D = make_discriminator(cfg.disc, self.z_dim, cfg.disc_hidden_dim).to(device)
         self.Q_D = ForwardMap(
             self.obs_dim, self.act_dim, self.z_dim, cfg.hidden_dim, cfg.num_parallel, output_dim=1
         ).to(device)
@@ -549,38 +519,19 @@ class FBPaired(TensorDictModuleBase):
         with torch.no_grad():
             z_data = self._dataset_z(batch.shape[0])
             z_policy = self._encode_fb(batch["next", FB_KEY])
-        logits_data = self.D.logits(z_data)
-        logits_policy = self.D.logits(z_policy)
-        loss_data = -F.logsigmoid(logits_data)
-        loss_policy = F.softplus(logits_policy)
-        loss = (loss_data + loss_policy).mean()
-        penalty = logits_data.new_zeros(())
-        if self.cfg.grad_penalty > 0.0:
-            penalty = self._z_gradient_penalty(z_data, z_policy)
-            loss = loss + self.cfg.grad_penalty * penalty
+        stats = self.D.compute_loss(z_data, z_policy, self.cfg.grad_penalty)
         self.opt_D.zero_grad(set_to_none=True)
-        loss.backward()
+        stats["loss"].backward()
         grad_norm = nn.utils.clip_grad_norm_(self.D.parameters(), self.cfg.max_grad_norm)
         self.opt_D.step()
-        with torch.no_grad():
-            accuracy = 0.5 * (
-                (logits_data > 0).float().mean() + (logits_policy < 0).float().mean()
-            )
         return {
-            "disc/loss": float(loss.detach()),
-            "disc/data": float(loss_data.mean().detach()),
-            "disc/policy": float(loss_policy.mean().detach()),
-            "disc/acc": float(accuracy),
-            "disc/penalty": float(penalty.detach()),
+            "disc/loss": float(stats["loss"].detach()),
+            "disc/data": float(stats["data"].detach()),
+            "disc/policy": float(stats["policy"].detach()),
+            "disc/acc": float(stats["acc"].detach()),
+            "disc/penalty": float(stats["penalty"].detach()),
             "disc/grad_norm": float(grad_norm),
         }
-
-    def _z_gradient_penalty(self, z_data: torch.Tensor, z_policy: torch.Tensor) -> torch.Tensor:
-        alpha = torch.rand(z_data.shape[0], 1, device=z_data.device)
-        interpolated = (alpha * z_data + (1.0 - alpha) * z_policy).detach().requires_grad_(True)
-        logits = self.D.logits(interpolated)
-        gradients = autograd.grad(logits.sum(), interpolated, create_graph=True)[0]
-        return (gradients.norm(dim=-1) - 1.0).square().mean()
 
     def _update_q_d(self, batch: TensorDict, z: torch.Tensor) -> dict[str, float]:
         """Bellman backup of ``D``'s reward on the visited embedding, not on the prompt."""
@@ -590,7 +541,9 @@ class FBPaired(TensorDictModuleBase):
         discount = self._discount(batch).squeeze(-1)
         with torch.no_grad():
             achieved = self._encode_fb(batch["next", FB_KEY])
-            reward = unwrap_ddp(self.D).reward(achieved) + self.cfg.disc_reward_offset
+            reward = unwrap_ddp(self.D).reward(achieved)
+            if self.cfg.disc == "vanilla":
+                reward = reward + self.cfg.disc_reward_offset
             next_action = self._sample_action(next_obs, z, mean=False)
             next_q = uncertainty_target(
                 self.Q_D_target(next_obs, next_action, z),

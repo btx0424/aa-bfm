@@ -126,6 +126,7 @@ reward:
     energy_l1:          {weight: 2.0e-4}
     joint_acc_l2:       {weight: 2.5e-7}
     feet_sliding:       {weight: 0.2, body_names: .*ankle_roll_link}
+    joint_pos_limits:   {weight: 10.0, joint_names: ".*"}
 
 termination:
   max_episode_length: {}
