@@ -1,7 +1,9 @@
 """Paired LAFAN1 reference command for supervised FB training.
 
-Each episode is one clip. The robot starts at frame 0, the episode ends at the
-last frame, and the command exposes the reference at the configured lookahead steps.
+Each episode is one clip. The robot starts at a random frame that leaves at
+least ``MIN_REMAINING`` frames. The episode runs until the clip ends or the
+task's ``max_episode_length``, whichever comes first. The command exposes the
+reference at the configured lookahead steps.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from typing_extensions import override
 
 from active_adaptation.envs.mdp.commands.base import Command
 from active_adaptation.envs.mdp.rewards.base import Reward
-from active_adaptation.envs.utils.api import find_bodies
+from active_adaptation.envs.utils.api import find_bodies, find_joints
 from active_adaptation.utils.math import (
     axis_angle_from_quat,
     quat_conjugate,
@@ -43,9 +45,12 @@ _KEYPOINT_NAMES = (
     "right_wrist_yaw_link",
 )
 
+# Frames left after the sampled start. Clips shorter than this are not used.
+MIN_REMAINING = 1000
+
 
 class BFMCommand(Command):
-    """Track one LAFAN1 clip from frame 0, observing specific future frames."""
+    """Track one LAFAN1 clip from a random frame, observing specific future frames."""
 
     out_keys = ["crash_active", "fall_over_active"]
 
@@ -73,6 +78,7 @@ class BFMCommand(Command):
     @override
     def _initialize(self, env) -> None:
         super()._initialize(env)
+        self.episode_length_cap = int(self.env.cfg.max_episode_length)
         if abs(float(self.env.step_dt) - 1.0 / TARGET_FPS) > 1.0e-4:
             raise ValueError(
                 f"BFMCommand motions are {TARGET_FPS} Hz, but step_dt is {self.env.step_dt}"
@@ -90,6 +96,13 @@ class BFMCommand(Command):
             device=self.device,
         )
         self.joint_names = joint_names
+        # ``joint_pos`` observations are emitted in simulation order. The prompt
+        # must use that same order, not ``asset.joint_names``.
+        _, sim_names = find_joints(self.asset, ".*")
+        motion_index = {name: index for index, name in enumerate(joint_names)}
+        columns = [motion_index.get(name, -1) for name in sim_names]
+        self.fb_joint_names = list(sim_names)
+        self.fb_joint_motion_index = torch.tensor(columns, dtype=torch.long, device=self.device)
         clip_names = [str(name) for name in motions["clip_names"].tolist()]
         keep = self._select_clip_ids(clip_names)
         starts = motions["starts"]
@@ -106,6 +119,16 @@ class BFMCommand(Command):
             raise ValueError(
                 f"Every selected clip must be longer than lookahead {furthest}, got {min(lengths)}"
             )
+        long_enough = [index for index, length in enumerate(lengths) if length >= MIN_REMAINING]
+        if not long_enough:
+            raise ValueError(
+                f"No selected clip has {MIN_REMAINING} frames. Lengths: "
+                f"{dict(zip(self.clip_names, lengths))}"
+            )
+        skipped = [self.clip_names[index] for index in range(len(lengths)) if index not in set(long_enough)]
+        if skipped:
+            print(f"Skipping clips shorter than {MIN_REMAINING}: {skipped}", flush=True)
+        self.sample_clip_ids = torch.tensor(long_enough, dtype=torch.long, device=self.device)
         cursor = 0
         packed_starts = []
         packed_ends = []
@@ -145,6 +168,11 @@ class BFMCommand(Command):
             raise IndexError(
                 f"Motion joint index {int(self.asset_joint_index.max())} "
                 f"is outside joint_pos ({joint_count})"
+            )
+        if len(self.fb_joint_names) != joint_count:
+            raise ValueError(
+                f"Simulation joint order has {len(self.fb_joint_names)} names, "
+                f"but joint_pos has {joint_count}"
             )
         self._clip_flags()
 
@@ -219,13 +247,25 @@ class BFMCommand(Command):
     def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase) -> torch.Tensor:
         env_ids = env_ids.to(self.device)
         count = env_ids.numel()
-        self.motion_ids[env_ids] = torch.randint(0, int(self.lengths.numel()), (count,), device=self.device)
-        self.t[env_ids] = 0
+        choice = torch.randint(0, int(self.sample_clip_ids.numel()), (count,), device=self.device)
+        motion_ids = self.sample_clip_ids[choice]
+        motion_lengths = self.lengths[motion_ids]
+        # ``t`` in ``[0, length - MIN_REMAINING]``. The episode is the frames
+        # left in the clip, capped at the task's original ``max_episode_length``.
+        span = (motion_lengths - MIN_REMAINING).to(torch.float)
+        t = (torch.rand(count, device=self.device) * (span + 1)).long()
+        self.motion_ids[env_ids] = motion_ids
+        self.t[env_ids] = t
+
+        remaining = torch.minimum(
+            motion_lengths - t,
+            torch.full_like(motion_lengths, self.episode_length_cap),
+        )
         max_len = self.env.max_episode_length.clone()
-        max_len[env_ids] = self.lengths[self.motion_ids[env_ids]].unsqueeze(-1)
+        max_len[env_ids] = remaining.unsqueeze(-1)
         self.env.max_episode_length = max_len
 
-        frame = self.starts[self.motion_ids[env_ids]]
+        frame = self.starts[motion_ids] + t
         origins = self.env.scene.sample_spawn_origin_candidates(env_ids)
         root_state = self.init_root_state[env_ids].clone()
         root_state[:, 0:3] = origins + self.root_pos[frame]
@@ -264,8 +304,12 @@ class BFMCommand(Command):
         ref_lin_vel = self._gather(self.root_lin_vel, self._lookahead)
         ref_ang_vel = self._gather(self.root_ang_vel, self._lookahead)
         ref_joint = self._gather(self.joint_pos, self._lookahead)
-        joint_sim = ref_joint.new_zeros(self.num_envs, self.num_lookahead, self.sim_joint_dim)
-        joint_sim[..., self.asset_joint_index] = ref_joint
+        motion_index = self.fb_joint_motion_index
+        joint_sim = ref_joint.new_zeros(
+            self.num_envs, self.num_lookahead, motion_index.numel()
+        )
+        present = motion_index >= 0
+        joint_sim[..., present] = ref_joint[..., motion_index[present]]
         gravity = quat_rotate_inverse(
             self.ref_root_quat, self._gravity.expand_as(self.ref_root_quat[..., :3])
         )

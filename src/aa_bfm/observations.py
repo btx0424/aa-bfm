@@ -100,13 +100,13 @@ class fb_prompt(Observation):
             raise TypeError("fb_prompt requires BFMCommand")
         self.command = command
         self.asset = command.asset
-        self.joint_names = list(command.asset.joint_names)
+        self.joint_names = list(command.fb_joint_names)
         self.horizon = int(command.num_lookahead)
         frame_dim = int(command.ref_fb_state.shape[-1])
         if frame_dim != len(self.joint_names) + 6:
             raise ValueError(
                 f"ref_fb_state frame is {frame_dim}, expected "
-                f"{len(self.joint_names)} joints + gravity + angular velocity"
+                f"{len(self.joint_names)} simulation-order joints + gravity + angular velocity"
             )
 
     @override
