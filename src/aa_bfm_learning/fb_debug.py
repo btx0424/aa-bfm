@@ -6,7 +6,8 @@ every enabled reward group, conditioned on the policy observation and the
 ``command`` reference. The command is the lookahead the tracking reward was
 computed from; ``z`` does not contain root position or keypoints, so the
 critic has to see ``command`` itself. The critic target is an n-step return
-of that sum, bootstrapped at the command of the state ``n`` steps ahead.
+of that sum. The bootstrap action comes from a target actor, Polyak-averaged
+at ``tau_actor``, evaluated at the command of the state ``n`` steps ahead.
 """
 
 from __future__ import annotations
@@ -87,10 +88,14 @@ class FBDebugConfig(FBPairedConfig):
     # Critic only. ``F`` and ``B`` stay one-step. ``1`` is the previous backup.
     n_steps: int = 3
     task_pessimism: float = 0.5
+    # Lag of the actor used only for the Q bootstrap.
+    tau_actor: float = 0.01
 
     def __post_init__(self):
         if self.n_steps < 1:
             raise ValueError(f"n_steps must be >= 1, got {self.n_steps}.")
+        if not 0.0 < self.tau_actor <= 1.0:
+            raise ValueError(f"tau_actor must be in (0, 1], got {self.tau_actor}.")
 
     def get_class(self):
         return FBDebug
@@ -133,6 +138,7 @@ class FBDebug(FBPaired):
         self.Q = TaskCritic(
             self.obs_dim, self.cmd_dim, self.act_dim, cfg.hidden_dim, cfg.num_parallel
         ).to(device)
+        self.actor_target = copy.deepcopy(self.actor).requires_grad_(False).eval()
         self.Q_target = copy.deepcopy(self.Q).requires_grad_(False).eval()
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr_actor)
         self.opt_Q = torch.optim.Adam(self.Q.parameters(), lr=cfg.lr_q)
@@ -144,7 +150,7 @@ class FBDebug(FBPaired):
         if self._distributed:
             self.actor = wrap_ddp(self.actor)
             self.Q = wrap_ddp(self.Q)
-            for module in (self.actor, self.Q, self.Q_target, self.vecnorm_cmd):
+            for module in (self.actor, self.actor_target, self.Q, self.Q_target, self.vecnorm_cmd):
                 for param in module.parameters():
                     torch.distributed.broadcast(param.data, src=0)
                 for buf in module.buffers():
@@ -182,6 +188,7 @@ class FBDebug(FBPaired):
                 infos.update(last)
         soft_copy_(unwrap_ddp(self.F), self.F_target, tau=self.cfg.tau)
         soft_copy_(unwrap_ddp(self.B), self.B_target, tau=self.cfg.tau)
+        soft_copy_(unwrap_ddp(self.actor), self.actor_target, tau=self.cfg.tau_actor)
         soft_copy_(unwrap_ddp(self.Q), self.Q_target, tau=self.cfg.tau)
         infos["rb_size"] = float(len(self.rb))
         return infos
@@ -196,11 +203,18 @@ class FBDebug(FBPaired):
             total = total + reward[key].sum(dim=-1)
         return total
 
-    def _sample_action(self, state: torch.Tensor, z: torch.Tensor, mean: bool) -> torch.Tensor:
+    def _sample_action(
+        self, state: torch.Tensor, z: torch.Tensor, mean: bool, *, target: bool = False
+    ) -> torch.Tensor:
         del z
         if self._action_command is None or self._action_command.shape[0] != state.shape[0]:
             raise RuntimeError("Task actor requires the normalized command for this batch.")
-        actor = self.actor if torch.is_grad_enabled() else unwrap_ddp(self.actor)
+        # The target actor is the Q bootstrap only. Rollout, the actor update,
+        # and the forward-backward backup stay on the live policy.
+        if target:
+            actor = self.actor_target
+        else:
+            actor = self.actor if torch.is_grad_enabled() else unwrap_ddp(self.actor)
         loc = actor(state, self._action_command)
         if mean:
             return 5.0 * loc
@@ -269,7 +283,7 @@ class FBDebug(FBPaired):
         with torch.no_grad():
             self._action_command = next_command.detach()
             # The task actor ignores ``z`` and reads ``_action_command``.
-            next_action = self._sample_action(next_obs, command, mean=False)
+            next_action = self._sample_action(next_obs, command, mean=False, target=True)
             next_q = uncertainty_target(
                 unwrap_ddp(self.Q_target)(next_obs, next_command, next_action),
                 self.cfg.task_pessimism,
@@ -321,6 +335,7 @@ class FBDebug(FBPaired):
         unwrap_ddp(self.Q).load_state_dict(state_dict["Q"], strict=strict)
         self.vecnorm_cmd.load_state_dict(state_dict["vecnorm_cmd"])
         self.Q_target.load_state_dict(unwrap_ddp(self.Q).state_dict())
+        self.actor_target.load_state_dict(unwrap_ddp(self.actor).state_dict())
 
 
 class FBDebugRolloutPolicy(FBRolloutPolicy):
