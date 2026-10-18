@@ -3,8 +3,12 @@
 On each update, ``z`` is the current ``B`` of ``fb_prompt``, except with
 probability ``achieved_z_prob`` it is ``B`` of that transition's own next
 ``fb_state``. There is no shuffle across the batch. The rollout still encodes
-the reference window to choose the action and does not store ``z``. There is
-no discriminator or auxiliary critic.
+the reference window to choose the action and does not store ``z``.
+
+``D`` sees only ``z``. Its positive samples are embeddings of dataset frames
+and its negative samples are embeddings of visited states, so the reward
+pushes the policy's embedding occupancy toward the dataset. ``Q_D`` is the
+critic of that reward. The actor ascends ``F^T z`` and ``Q_D``.
 
 The forward-backward residual is the UFO loss: squared off-diagonal successor
 measure, linear diagonal, and orthonormality on ``B``.
@@ -20,10 +24,12 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import autograd
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase
 from torchrl.envs.utils import ExplorationType, exploration_type
+from torchrl.objectives import hold_out_net
 
 import active_adaptation as aa
 from active_adaptation.learning.modules import VecNorm
@@ -156,7 +162,14 @@ class _ForwardMember(nn.Module):
     Width stays at ``hidden_dim`` (512). UFO uses 2048 and six blocks on each path.
     """
 
-    def __init__(self, state_dim: int, action_dim: int, z_dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        z_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+    ):
         super().__init__()
         half = hidden_dim // 2
         self.embed_z = nn.Sequential(
@@ -175,7 +188,7 @@ class _ForwardMember(nn.Module):
             _ResidualBlock(hidden_dim),
             _ResidualBlock(hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, z_dim),
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, state: torch.Tensor, action: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -185,10 +198,22 @@ class _ForwardMember(nn.Module):
 
 
 class ForwardMap(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, z_dim: int, hidden_dim: int, num_parallel: int):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        z_dim: int,
+        hidden_dim: int,
+        num_parallel: int,
+        output_dim: int | None = None,
+    ):
         super().__init__()
+        self.output_dim = z_dim if output_dim is None else output_dim
         self.members = nn.ModuleList(
-            [_ForwardMember(state_dim, action_dim, z_dim, hidden_dim) for _ in range(num_parallel)]
+            [
+                _ForwardMember(state_dim, action_dim, z_dim, hidden_dim, self.output_dim)
+                for _ in range(num_parallel)
+            ]
         )
         self.reset_parameters()
 
@@ -210,7 +235,42 @@ class ForwardMap(nn.Module):
                     nn.init.zeros_(linear.bias)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        return torch.stack([member(state, action, z) for member in self.members], dim=0)
+        values = torch.stack([member(state, action, z) for member in self.members], dim=0)
+        if self.output_dim == 1:
+            return values.squeeze(-1)
+        return values
+
+
+class ZDiscriminator(nn.Module):
+    """Classify ``z`` alone: dataset embeddings versus embeddings of visited states."""
+
+    def __init__(self, z_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(z_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        gain = nn.init.calculate_gain("relu")
+        linears = [module for module in self.net if isinstance(module, nn.Linear)]
+        for linear in linears[:-1]:
+            nn.init.orthogonal_(linear.weight, gain=gain)
+            nn.init.zeros_(linear.bias)
+        nn.init.orthogonal_(linears[-1].weight, gain=0.01)
+        nn.init.zeros_(linears[-1].bias)
+
+    def logits(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)
+
+    def reward(self, z: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+        """``log D(z) - log(1 - D(z))``. High when ``z`` looks like the dataset."""
+        probability = torch.sigmoid(self.logits(z)).clamp(eps, 1.0 - eps)
+        return probability.log() - (1.0 - probability).log()
 
 
 class FBActor(nn.Module):
@@ -256,6 +316,13 @@ class FBPairedConfig:
     max_grad_norm: float = 10000.0
     # Fraction of update rows whose prompt is B(next fb_state), not the reference.
     achieved_z_prob: float = 0.2
+    lr_discriminator: float = 1.0e-5
+    lr_q_d: float = 3.0e-4
+    # Actor weight on Q_D. ``scale_reg`` multiplies it by mean |F^T z|.
+    reg_coeff: float = 0.05
+    scale_reg: bool = True
+    grad_penalty: float = 10.0
+    disc_hidden_dim: int = 256
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY, PROMPT_KEY)
 
@@ -318,16 +385,36 @@ class FBPaired(TensorDictModuleBase):
         self.B_target = copy.deepcopy(self.B).requires_grad_(False).eval()
         self.F_target = copy.deepcopy(self.F).requires_grad_(False).eval()
 
+        self.D = ZDiscriminator(self.z_dim, cfg.disc_hidden_dim).to(device)
+        self.Q_D = ForwardMap(
+            self.obs_dim, self.act_dim, self.z_dim, cfg.hidden_dim, cfg.num_parallel, output_dim=1
+        ).to(device)
+        self.Q_D_target = copy.deepcopy(self.Q_D).requires_grad_(False).eval()
         self.opt_B = torch.optim.Adam(self.B.parameters(), lr=cfg.lr_b)
         self.opt_F = torch.optim.Adam(self.F.parameters(), lr=cfg.lr_f)
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr_actor)
+        self.opt_D = torch.optim.Adam(self.D.parameters(), lr=cfg.lr_discriminator)
+        self.opt_Q_D = torch.optim.Adam(self.Q_D.parameters(), lr=cfg.lr_q_d)
 
         self._distributed = aa.is_distributed()
         if self._distributed:
             self.B = wrap_ddp(self.B)
             self.F = wrap_ddp(self.F)
             self.actor = wrap_ddp(self.actor)
-            for module in (self.B, self.F, self.actor, self.B_target, self.F_target, self.vecnorm_obs, self.vecnorm_b):
+            self.D = wrap_ddp(self.D)
+            self.Q_D = wrap_ddp(self.Q_D)
+            for module in (
+                self.B,
+                self.F,
+                self.actor,
+                self.D,
+                self.Q_D,
+                self.B_target,
+                self.F_target,
+                self.Q_D_target,
+                self.vecnorm_obs,
+                self.vecnorm_b,
+            ):
                 for param in module.parameters():
                     torch.distributed.broadcast(param.data, src=0)
                 for buf in module.buffers():
@@ -391,12 +478,15 @@ class FBPaired(TensorDictModuleBase):
             if batch.batch_dims >= 2 and batch.batch_size[0] == 1:
                 batch = batch[0]
             z = self._mixed_z(batch)
-            last = self._update_fb(batch, z)
+            last = self._update_discriminator(batch)
+            last.update(self._update_q_d(batch, z))
+            last.update(self._update_fb(batch, z))
             last.update(self._update_actor(batch, z))
             if i == updates - 1:
                 infos.update(last)
         soft_copy_(unwrap_ddp(self.F), self.F_target, tau=self.cfg.tau)
         soft_copy_(unwrap_ddp(self.B), self.B_target, tau=self.cfg.tau)
+        soft_copy_(unwrap_ddp(self.Q_D), self.Q_D_target, tau=self.cfg.tau)
         infos.update(self._prompt_check())
         infos["rb_size"] = float(len(self.rb))
         return infos
@@ -424,6 +514,76 @@ class FBPaired(TensorDictModuleBase):
         noise = noise.clamp(-self.cfg.stddev_clip, self.cfg.stddev_clip)
         action = (loc + noise).clamp(-1.0 + 1.0e-6, 1.0 - 1.0e-6)
         return 5.0 * action
+
+    def _encode_fb(self, state: torch.Tensor) -> torch.Tensor:
+        """``Π(B(s))`` for one ``fb_state`` frame per row. ``state`` is raw."""
+        return unwrap_ddp(self.B)(self._normalize_b(state))
+
+    def _dataset_z(self, count: int) -> torch.Tensor:
+        frames = self.command_manager.fb_frames
+        index = torch.randint(0, frames.shape[0], (count,), device=frames.device)
+        return self._encode_fb(frames[index])
+
+    def _update_discriminator(self, batch: TensorDict) -> dict[str, float]:
+        """Match ``B`` of visited states to ``B`` of dataset frames. ``D`` sees ``z`` only."""
+        with torch.no_grad():
+            z_data = self._dataset_z(batch.shape[0])
+            z_policy = self._encode_fb(batch["next", FB_KEY])
+        logits_data = self.D.logits(z_data)
+        logits_policy = self.D.logits(z_policy)
+        loss_data = -F.logsigmoid(logits_data)
+        loss_policy = F.softplus(logits_policy)
+        loss = (loss_data + loss_policy).mean()
+        penalty = logits_data.new_zeros(())
+        if self.cfg.grad_penalty > 0.0:
+            penalty = self._z_gradient_penalty(z_data, z_policy)
+            loss = loss + self.cfg.grad_penalty * penalty
+        self.opt_D.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(self.D.parameters(), self.cfg.max_grad_norm)
+        self.opt_D.step()
+        return {
+            "disc/loss": float(loss.detach()),
+            "disc/data": float(loss_data.mean().detach()),
+            "disc/policy": float(loss_policy.mean().detach()),
+            "disc/penalty": float(penalty.detach()),
+            "disc/grad_norm": float(grad_norm),
+        }
+
+    def _z_gradient_penalty(self, z_data: torch.Tensor, z_policy: torch.Tensor) -> torch.Tensor:
+        alpha = torch.rand(z_data.shape[0], 1, device=z_data.device)
+        interpolated = (alpha * z_data + (1.0 - alpha) * z_policy).detach().requires_grad_(True)
+        logits = self.D.logits(interpolated)
+        gradients = autograd.grad(logits.sum(), interpolated, create_graph=True)[0]
+        return (gradients.norm(dim=-1) - 1.0).square().mean()
+
+    def _update_q_d(self, batch: TensorDict, z: torch.Tensor) -> dict[str, float]:
+        """Bellman backup of ``D``'s reward on the visited embedding, not on the prompt."""
+        obs = self._normalize_obs(batch[OBS_KEY])
+        next_obs = self._normalize_obs(batch["next", OBS_KEY])
+        action = batch[ACTION_KEY]
+        discount = self._discount(batch).squeeze(-1)
+        with torch.no_grad():
+            achieved = self._encode_fb(batch["next", FB_KEY])
+            reward = unwrap_ddp(self.D).reward(achieved)
+            next_action = self._sample_action(next_obs, z, mean=False)
+            next_q = uncertainty_target(
+                self.Q_D_target(next_obs, next_action, z),
+                self.cfg.actor_pessimism,
+            )
+            target = reward + discount * next_q
+        q = self.Q_D(obs, action, z)
+        loss = F.mse_loss(q.float(), target.float().unsqueeze(0).expand_as(q))
+        self.opt_Q_D.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(self.Q_D.parameters(), self.cfg.max_grad_norm)
+        self.opt_Q_D.step()
+        return {
+            "qd/loss": float(loss.detach()),
+            "qd/q": float(q.mean().detach()),
+            "qd/reward": float(reward.mean().detach()),
+            "qd/grad_norm": float(grad_norm),
+        }
 
     def _mixed_z(self, batch: TensorDict) -> torch.Tensor:
         """Reference prompt, replaced on some rows by ``B`` of the achieved next state.
@@ -530,17 +690,20 @@ class FBPaired(TensorDictModuleBase):
             z = self._mixed_z(batch)
         action = self._sample_action(obs, z, mean=False)
         features = self.F(obs, action, z)
-        q = uncertainty_target((features * z).sum(-1), self.cfg.actor_pessimism)
-        loss = -q.mean()
-        self.opt_actor.zero_grad(set_to_none=True)
-        loss.backward()
+        q_fb = uncertainty_target((features * z).sum(-1), self.cfg.actor_pessimism)
+        with hold_out_net(self.Q_D):
+            q_d = uncertainty_target(self.Q_D(obs, action, z), self.cfg.actor_pessimism)
+            weight = q_fb.abs().mean().detach() if self.cfg.scale_reg else q_fb.new_ones(())
+            loss = -(q_fb.mean() + self.cfg.reg_coeff * weight * q_d.mean())
+            self.opt_actor.zero_grad(set_to_none=True)
+            loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.opt_actor.step()
-        # Same units as ``fb/q_value``. The optimized loss is still ``-F^T z``.
         scale = float(self.z_dim)
         return {
-            "actor/loss": float(loss.detach()) / scale,
-            "actor/q": float(q.mean().detach()) / scale,
+            "actor/loss": float(loss.detach()),
+            "actor/q": float(q_fb.mean().detach()) / scale,
+            "actor/q_d": float(q_d.mean().detach()),
             "actor/grad_norm": float(grad_norm),
         }
 
@@ -601,6 +764,8 @@ class FBPaired(TensorDictModuleBase):
             "B": unwrap_ddp(self.B).state_dict(),
             "F": unwrap_ddp(self.F).state_dict(),
             "actor": unwrap_ddp(self.actor).state_dict(),
+            "D": unwrap_ddp(self.D).state_dict(),
+            "Q_D": unwrap_ddp(self.Q_D).state_dict(),
             "vecnorm_obs": self.vecnorm_obs.state_dict(),
             "vecnorm_b": self.vecnorm_b.state_dict(),
         }
@@ -609,6 +774,10 @@ class FBPaired(TensorDictModuleBase):
         unwrap_ddp(self.B).load_state_dict(state_dict["B"], strict=strict)
         unwrap_ddp(self.F).load_state_dict(state_dict["F"], strict=strict)
         unwrap_ddp(self.actor).load_state_dict(state_dict["actor"], strict=strict)
+        if "D" in state_dict:
+            unwrap_ddp(self.D).load_state_dict(state_dict["D"], strict=strict)
+            unwrap_ddp(self.Q_D).load_state_dict(state_dict["Q_D"], strict=strict)
+            self.Q_D_target.load_state_dict(unwrap_ddp(self.Q_D).state_dict())
         self.vecnorm_obs.load_state_dict(state_dict["vecnorm_obs"])
         self.vecnorm_b.load_state_dict(state_dict["vecnorm_b"])
         self.B_target.load_state_dict(unwrap_ddp(self.B).state_dict())
