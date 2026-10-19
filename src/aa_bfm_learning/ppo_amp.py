@@ -1,13 +1,13 @@
-"""PPO with an AMP reward on ``fb_state``.
+"""PPO with an AMP reward on ``amp_state``.
 
 The task return is unchanged. This policy adds the discriminator reward on
-the rollout's ``fb_state`` before the advantage. The default score is LSGAN:
+the rollout's ``amp_state`` before the advantage. The default score is LSGAN:
 dataset frames are pulled to +1 and policy frames to -1, and the reward is
 ``max(0, 1 - ¼(D - 1)²)``.
 
-Expert rows are the clip table ``BFMCommand.fb_frames`` with joint velocity
-and root linear velocity removed, so they match the ``fb_state`` group
-(joint position, projected gravity, root angular velocity).
+Expert rows use the same layout as the ``amp_state`` group: simulation-order
+joint position and velocity, root angular velocity, projected gravity, then
+ankle and wrist positions in the root frame.
 """
 
 from __future__ import annotations
@@ -24,36 +24,28 @@ import active_adaptation as aa
 from active_adaptation.learning.modules import VecNorm
 from active_adaptation.learning.ppo.common import CMD_KEY, OBS_KEY, REWARD_KEY
 from active_adaptation.learning.ppo.ppo import PPOConfig, PPOPolicy
+from active_adaptation.utils.math import quat_rotate_inverse
 
 from .adversarial import make_discriminator
 
 cs = ConfigStore.instance()
 
-FB_KEY = "fb_state"
-
-
-def expert_fb_state(frames: torch.Tensor) -> torch.Tensor:
-    """``fb_frames`` rows in the ``fb_state`` observation layout.
-
-    The table is joint position, joint velocity, gravity, root angular
-    velocity, root linear velocity. The observation drops both velocities.
-    """
-    width = int(frames.shape[-1])
-    if (width - 9) % 2 != 0:
-        raise ValueError(f"fb_frames width {width} is not 2 * joints + 9.")
-    joints = (width - 9) // 2
-    joint_pos = frames[..., :joints]
-    gravity = frames[..., 2 * joints : 2 * joints + 3]
-    ang_vel = frames[..., 2 * joints + 3 : 2 * joints + 6]
-    return torch.cat((joint_pos, gravity, ang_vel), dim=-1)
-
+AMP_STATE_KEY = "amp_state"
+# ``find_bodies`` walks ``body_names_simulation``, so the regexes
+# ``.*_ankle_roll_link`` then ``.*_wrist_roll_link`` resolve in this order.
+_AMP_BODY_NAMES = (
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+    "left_wrist_roll_link",
+    "right_wrist_roll_link",
+)
 
 @dataclass
 class AMPPPOConfig(PPOConfig):
     _target_: str = "aa_bfm_learning.ppo_amp.AMPPPOConfig"
     name: str = "ppo_amp"
-    # Keep ``fb_state`` in the env. The actor still reads command and policy.
-    in_keys: tuple[str, ...] = (CMD_KEY, OBS_KEY, FB_KEY)
+    # Keep ``amp_state`` in the env. The actor still reads command and policy.
+    in_keys: tuple[str, ...] = (CMD_KEY, OBS_KEY, "amp_state")
     # ``vanilla`` | ``lsgan`` | ``wgan``.
     disc: str = "lsgan"
     disc_hidden_dim: int = 256
@@ -82,19 +74,20 @@ class AMPPPO(PPOPolicy):
         super().__init__(cfg, observation_spec, action_spec, reward_spec, device, env)
         if env is None or not hasattr(env, "command_manager"):
             raise TypeError("ppo_amp requires the env command manager.")
-        if FB_KEY not in observation_spec.keys(True, True):
+        if AMP_STATE_KEY not in observation_spec.keys(True, True):
             raise KeyError(
-                "ppo_amp requires the fb_state observation. "
+                "ppo_amp requires the amp_state observation. "
                 "Keep it in algo.in_keys so the env does not drop it."
             )
         self.command_manager = env.command_manager
-        if not hasattr(self.command_manager, "fb_frames"):
-            raise TypeError("ppo_amp requires BFMCommand.fb_frames.")
-        frames = expert_fb_state(self.command_manager.fb_frames[:1])
-        obs_dim = int(observation_spec[FB_KEY].shape[-1])
-        if int(frames.shape[-1]) != obs_dim:
+        from aa_bfm.commands import BFMCommand
+        if not isinstance(self.command_manager, BFMCommand):
+            raise TypeError("ppo_amp requires BFMCommand.")
+        self.expert_amp = self._expert_amp().to(self.device)
+        obs_dim = int(observation_spec[AMP_STATE_KEY].shape[-1])
+        if int(self.expert_amp.shape[-1]) != obs_dim:
             raise ValueError(
-                f"fb_state is {obs_dim}-d but the clip table slice is {frames.shape[-1]}-d."
+                f"amp_state is {obs_dim}-d but the clip table is {self.expert_amp.shape[-1]}-d."
             )
         self.fb_dim = obs_dim
         self.vecnorm_amp = VecNorm(self.fb_dim, decay=1.0).to(self.device)
@@ -114,13 +107,43 @@ class AMPPPO(PPOPolicy):
         return dict(sorted(info.items()))
 
     def _flat_fb(self, tensordict: TensorDictBase) -> torch.Tensor:
-        state = tensordict[FB_KEY]
+        state = tensordict[AMP_STATE_KEY]
         return state.reshape(-1, self.fb_dim)
 
     def _sample_expert(self, count: int) -> torch.Tensor:
-        frames = self.command_manager.fb_frames
-        index = torch.randint(0, frames.shape[0], (count,), device=frames.device)
-        return expert_fb_state(frames[index]).to(self.device)
+        index = torch.randint(0, self.expert_amp.shape[0], (count,), device=self.expert_amp.device)
+        return self.expert_amp[index]
+
+    def _expert_amp(self) -> torch.Tensor:
+        """Clip frames in the ``amp_state`` layout.
+
+        Joints follow ``BFMCommand.fb_joint_names`` (simulation order, the same
+        order as ``joint_pos`` / ``joint_vel`` with ``joint_names: ".*"``).
+        Body positions are looked up by name because the archive is in MuJoCo
+        body order.
+        """
+        command = self.command_manager
+        columns = command.fb_joint_motion_index
+        present = columns >= 0
+        joint_pos = command.joint_pos.new_zeros(command.joint_pos.shape[0], columns.numel())
+        joint_vel = command.joint_vel.new_zeros(command.joint_vel.shape[0], columns.numel())
+        joint_pos[:, present] = command.joint_pos[:, columns[present]]
+        joint_vel[:, present] = command.joint_vel[:, columns[present]]
+
+        gravity_w = command.root_quat.new_tensor((0.0, 0.0, -1.0)).expand(command.root_quat.shape[0], 3)
+        gravity_b = quat_rotate_inverse(command.root_quat, gravity_w)
+        gravity_b = gravity_b / gravity_b.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        ang_vel_b = quat_rotate_inverse(command.root_quat, command.root_ang_vel)
+
+        name_to_index = {name: index for index, name in enumerate(command.motion_body_names)}
+        missing = [name for name in _AMP_BODY_NAMES if name not in name_to_index]
+        if missing:
+            raise KeyError(f"amp_state bodies missing from the motion archive: {missing}")
+        body_index = [name_to_index[name] for name in _AMP_BODY_NAMES]
+        delta = command.body_pos[:, body_index] - command.root_pos[:, None, :]
+        body_pos_b = quat_rotate_inverse(command.root_quat[:, None, :], delta)
+        body_pos_b = body_pos_b.reshape(body_pos_b.shape[0], -1)
+        return torch.cat((joint_pos, joint_vel, ang_vel_b, gravity_b, body_pos_b), dim=-1)
 
     def _normalize(self, policy: torch.Tensor, expert: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if aa.is_distributed():
@@ -153,7 +176,7 @@ class AMPPPO(PPOPolicy):
 
     @torch.no_grad()
     def _amp_reward(self, tensordict: TensorDictBase) -> torch.Tensor:
-        state = tensordict[FB_KEY]
+        state = tensordict[AMP_STATE_KEY]
         flat = state.reshape(-1, self.fb_dim)
         with VecNorm.freeze():
             normalized = self.vecnorm_amp(flat)

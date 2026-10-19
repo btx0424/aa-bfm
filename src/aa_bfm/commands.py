@@ -149,8 +149,11 @@ class BFMCommand(Command):
         missing_bodies = [name for name in _KEYPOINT_NAMES if name not in body_names]
         if missing_bodies:
             raise KeyError(f"Keypoints missing from the motion archive: {missing_bodies}")
+        # Archive body order (MuJoCo), not the articulation's simulation order.
+        self.motion_body_names = body_names
+        self.body_pos = take("body_pos")
         motion_index = [body_names.index(name) for name in _KEYPOINT_NAMES]
-        self.keypoint_pos = take("body_pos")[:, motion_index]
+        self.keypoint_pos = self.body_pos[:, motion_index]
         self.keypoint_quat = take("body_quat")[:, motion_index]
         asset_index, self.keypoint_names = find_bodies(self.asset, list(_KEYPOINT_NAMES))
         order = [list(_KEYPOINT_NAMES).index(name) for name in self.keypoint_names]
@@ -602,7 +605,7 @@ class tracking_root_vel_xy_exp(Reward):
         command = self.command_manager
         if not isinstance(command, BFMCommand):
             raise TypeError("tracking_root_vel_xy_exp requires BFMCommand")
-        current = command.asset.data.root_link_lin_vel_w[:, :2]
+        current = command.asset.data.root_com_lin_vel_w[:, :2]
         target = command.cur_root_lin_vel[:, :2]
         error = (current - target).square().sum(dim=-1, keepdim=True)
         return torch.exp(-error / self.std**2)
@@ -620,7 +623,7 @@ class tracking_root_yaw_vel_exp(Reward):
         command = self.command_manager
         if not isinstance(command, BFMCommand):
             raise TypeError("tracking_root_yaw_vel_exp requires BFMCommand")
-        current = _yaw_rate(command.asset.data.root_link_quat_w, command.asset.data.root_link_ang_vel_w)
+        current = _yaw_rate(command.asset.data.root_link_quat_w, command.asset.data.root_com_ang_vel_w)
         target = _yaw_rate(command.cur_root_quat, command.cur_root_ang_vel)
         error = (current - target).square().unsqueeze(-1)
         return torch.exp(-error / self.std**2)
